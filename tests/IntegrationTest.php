@@ -230,3 +230,67 @@ describe('the context enricher', function (): void {
             ->and($context['env'] ?? null)->toBe('testing');
     });
 });
+
+describe('hardening found by review', function (): void {
+    it('does not replace an application Guzzle client that is already bound', function (): void {
+        // An unconditional bind replaced the application's own client —
+        // base_uri, auth, timeouts, even a test mock handler — with a bare
+        // default. That breaks production requests and sends test suites to
+        // the network.
+        $this->app->bind(GuzzleClient::class, static fn (): GuzzleClient => new GuzzleClient([
+            'base_uri' => 'https://configured.example.com',
+            'timeout' => 42,
+        ]));
+
+        $this->app->register(\Ssx\Wiretap\Laravel\WiretapServiceProvider::class, true);
+
+        $client = app(GuzzleClient::class);
+
+        expect((string) $client->getConfig('base_uri'))->toBe('https://configured.example.com')
+            ->and($client->getConfig('timeout'))->toBe(42);
+    });
+
+    it('records the route template rather than the concrete path', function (): void {
+        // /reset-password/<token> is a credential. No body-path rule can
+        // protect something recorded in context.
+        Route::get('/reset-password/{token}', function () {
+            Http::get('https://api.example.com/v1/verify');
+
+            return 'ok';
+        })->name('password.reset');
+
+        Http::fake(['api.example.com/*' => Http::response([], 200)]);
+
+        $this->get('/reset-password/SUPERSECRETVALUE')->assertOk();
+
+        $context = recorded($this->logPath)[0]->context;
+
+        expect($context['uri'] ?? '')->toBe('/reset-password/{token}')
+            ->and(json_encode($context))->not->toContain('SUPERSECRETVALUE');
+    });
+
+    it('publishes its recorder even when capture is disabled', function (): void {
+        // Returning early left whatever a previous application put on the
+        // holder. In a worker running several applications, an enabled
+        // recorder from an earlier one kept receiving traffic.
+        $this->bootWith(['wiretap.enabled' => false]);
+
+        expect(Wiretap::recorder())->toBe(app(Recorder::class))
+            ->and(Wiretap::recorder()->isEnabled())->toBeFalse();
+    });
+
+    it('keeps an env blocklist entry after config caching', function (): void {
+        // EnvBlocklistProvider reads getenv() at runtime, but a cached config
+        // means later processes never load .env — so the rule vanished while
+        // capture stayed on.
+        putenv('WIRETAP_BLOCK=private.example.com');
+
+        try {
+            $config = require __DIR__ . '/../config/wiretap.php';
+
+            expect($config['blocklist'])->toContain('private.example.com');
+        } finally {
+            putenv('WIRETAP_BLOCK');
+        }
+    });
+});
