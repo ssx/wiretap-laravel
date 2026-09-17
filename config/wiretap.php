@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Ssx\Wiretap\Blocklist\EnvBlocklistProvider;
 use Ssx\Wiretap\Blocklist\PresetBlocklistProvider;
 
 return [
@@ -43,10 +44,20 @@ return [
         PresetBlocklistProvider::CLOUD_METADATA,
     ],
 
-    'blocklist' => array_filter(array_map('trim', explode(',', (string) env('WIRETAP_BLOCK', '')))) + [
-        // 'internal-billing.example.com',
-        // '*.myacquirer.test',
-    ],
+    'blocklist' => array_merge(
+        // Parsed with the core tokenizer, not explode(',').
+        //
+        // A comma is legal inside a regex quantifier, so splitting on every
+        // one turned ~...[0-9]{1,3}$~ into two invalid rules. And once the
+        // config is cached Laravel stops loading .env, so the runtime provider
+        // cannot make up the difference — the rule simply vanishes in exactly
+        // the deployments most likely to have capture switched on.
+        EnvBlocklistProvider::parse((string) env('WIRETAP_BLOCK', '')),
+        [
+            // 'internal-billing.example.com',
+            // '*.myacquirer.test',
+        ],
+    ),
 
     /*
     |--------------------------------------------------------------------------
