@@ -6,6 +6,9 @@ namespace Ssx\Wiretap\Laravel;
 
 use GuzzleHttp\Client as GuzzleClient;
 use Illuminate\Contracts\Http\Kernel;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessed;
+use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\ServiceProvider;
 use Ssx\Wiretap\Blocklist\ArrayBlocklistProvider;
@@ -21,6 +24,7 @@ use Ssx\Wiretap\Laravel\Console\PruneCommand;
 use Ssx\Wiretap\Laravel\Console\ShowCommand;
 use Ssx\Wiretap\Laravel\Console\TraceCommand;
 use Ssx\Wiretap\Laravel\Http\StartCorrelation;
+use Ssx\Wiretap\Laravel\Queue\StartJobCorrelation;
 use Ssx\Wiretap\Reader\NdjsonReader;
 use Ssx\Wiretap\Recorder;
 use Ssx\Wiretap\Redaction\RedactionConfig;
@@ -37,6 +41,8 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->mergeConfigFrom(__DIR__ . '/../config/wiretap.php', 'wiretap');
 
         $this->app->singleton(Recorder::class, fn (): Recorder => $this->buildRecorder());
+
+        $this->app->singleton(StartJobCorrelation::class);
 
         $this->app->singleton(NdjsonReader::class, fn (): NdjsonReader => new NdjsonReader(
             (string) config('wiretap.path'),
@@ -68,12 +74,19 @@ final class WiretapServiceProvider extends ServiceProvider
         // traffic under its own policy.
         Wiretap::setRecorder($recorder);
 
-        if (!config('wiretap.enabled')) {
-            return;
-        }
-
         $this->registerCorrelationMiddleware();
-        $this->attachCaptureSurfaces($recorder);
+        $this->registerQueueCorrelation();
+
+        // Surfaces are attached even when capture is disabled.
+        //
+        // They resolve the recorder per call, and a disabled recorder records
+        // nothing — shouldCapture() returns false before anything is read. But
+        // skipping installation entirely meant Wiretap::fake() in a test
+        // replaced the recorder and then had no capture surface to record
+        // through, so assertSent() failed on traffic that had definitely
+        // happened. The package's own tests hid that by enabling wiretap in
+        // the test environment.
+        $this->attachCaptureSurfaces();
     }
 
     private function buildRecorder(): Recorder
@@ -126,6 +139,24 @@ final class WiretapServiceProvider extends ServiceProvider
         ]);
     }
 
+    /**
+     * A persistent worker never reaches the HTTP middleware, so without this
+     * every job it handles shares one correlation and one sampling decision.
+     */
+    private function registerQueueCorrelation(): void
+    {
+        if (!$this->app->bound('events')) {
+            return;
+        }
+
+        $events = $this->app->make('events');
+        $listener = $this->app->make(StartJobCorrelation::class);
+
+        $events->listen(JobProcessing::class, [$listener, 'processing']);
+        $events->listen(JobProcessed::class, [$listener, 'processed']);
+        $events->listen(JobFailed::class, [$listener, 'failed']);
+    }
+
     private function registerCorrelationMiddleware(): void
     {
         if (!$this->app->bound(Kernel::class)) {
@@ -141,7 +172,7 @@ final class WiretapServiceProvider extends ServiceProvider
         }
     }
 
-    private function attachCaptureSurfaces(Recorder $recorder): void
+    private function attachCaptureSurfaces(): void
     {
         /** @var array<string, mixed> $capture */
         $capture = (array) config('wiretap.capture', []);

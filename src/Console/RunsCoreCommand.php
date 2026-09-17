@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ssx\Wiretap\Laravel\Console;
 
 use Ssx\Wiretap\Cli\Application;
+use Ssx\Wiretap\Cli\Output;
 
 /**
  * Runs a core CLI command from inside artisan.
@@ -23,13 +24,38 @@ trait RunsCoreCommand
     protected function runCore(string $command, array $arguments = []): int
     {
         $path = (string) config('wiretap.path');
-
         $argv = array_merge(['wiretap', $command], $arguments, ['--path=' . $path]);
 
-        // The core Application writes to STDOUT directly, which is what we
-        // want: its colour handling and column alignment are already correct,
-        // and piping through Laravel's output would only re-wrap it.
-        return (new Application())->run($argv);
+        // Capture the core CLI's output and replay it through Laravel's.
+        //
+        // Writing to STDOUT directly meant Artisan::call('wiretap:export') sent
+        // the HAR to process stdout while Artisan::output() came back empty, so
+        // buffered output and console assertions could not see any of it.
+        $stream = fopen('php://memory', 'w+');
+
+        if ($stream === false) {
+            return (new Application())->run($argv);
+        }
+
+        try {
+            $exitCode = (new Application(new Output(
+                $stream,
+                // Match Laravel's decision about colour rather than sniffing
+                // the stream, which is never a TTY.
+                decorated: $this->output->isDecorated(),
+            )))->run($argv);
+
+            rewind($stream);
+            $captured = stream_get_contents($stream);
+
+            if (is_string($captured) && $captured !== '') {
+                $this->output->write($captured);
+            }
+
+            return $exitCode;
+        } finally {
+            fclose($stream);
+        }
     }
 
     /**

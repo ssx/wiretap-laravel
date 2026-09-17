@@ -43,6 +43,47 @@ final readonly class LaravelContextEnricher implements ContextEnricher
     }
 
     /**
+     * The authenticated user's id, but only when a guard already has one.
+     *
+     * Resolving the user would force a session and a database query on routes
+     * that need neither, which is not a cost instrumentation should impose.
+     *
+     * The previous check asked method_exists() on the container's 'auth'
+     * binding, which is AuthManager — it forwards guard methods through
+     * __call(), so method_exists() was always false and the advertised user_id
+     * was never captured at all.
+     */
+    private function resolvedUserId(): string|int|null
+    {
+        if (!$this->app->bound('auth')) {
+            return null;
+        }
+
+        try {
+            $manager = $this->app->make('auth');
+
+            if (!is_object($manager) || !method_exists($manager, 'guard')) {
+                return null;
+            }
+
+            $guard = $manager->guard();
+
+            if (!is_object($guard)
+                || !method_exists($guard, 'hasUser')
+                || !method_exists($guard, 'id')
+                || !$guard->hasUser()) {
+                return null;
+            }
+
+            $id = $guard->id();
+
+            return is_string($id) || is_int($id) ? $id : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * @return array<string, scalar|null>
      */
     private function consoleContext(): array
@@ -89,15 +130,7 @@ final readonly class LaravelContextEnricher implements ContextEnricher
         // Resolving the user forces a session and a database query on routes
         // that do not otherwise need either, so only read what is already
         // resolved.
-        if ($this->app->bound('auth')) {
-            $guard = $this->app->make('auth');
-
-            if (is_object($guard) && method_exists($guard, 'hasUser') && $guard->hasUser()) {
-                /** @var mixed $id */
-                $id = method_exists($guard, 'id') ? $guard->id() : null;
-                $context['user_id'] = is_scalar($id) ? $id : null;
-            }
-        }
+        $context['user_id'] = $this->resolvedUserId();
 
         return array_filter($context, static fn (mixed $v): bool => $v !== null && $v !== '');
     }
