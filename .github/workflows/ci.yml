@@ -19,10 +19,14 @@ jobs:
         php: ['8.2', '8.3', '8.4']
         laravel: ['11.*', '12.*']
         include:
+          # Laravel 12's testbench pulls PHPUnit 12, which Pest 2 conflicts
+          # with, so each leg pins the Pest major that matches its PHPUnit.
           - laravel: '11.*'
             testbench: '9.*'
+            pest: '^2.34'
           - laravel: '12.*'
             testbench: '10.*'
+            pest: '^3.0'
 
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +41,8 @@ jobs:
         run: |
           composer require --no-update --dev \
             "laravel/framework:${{ matrix.laravel }}" \
-            "orchestra/testbench:${{ matrix.testbench }}"
+            "orchestra/testbench:${{ matrix.testbench }}" \
+            "pestphp/pest:${{ matrix.pest }}"
           composer update --prefer-dist --no-interaction --no-progress
 
       - name: Run tests
