@@ -6,6 +6,7 @@ namespace Ssx\Wiretap\Laravel\Console;
 
 use Ssx\Wiretap\Cli\Application;
 use Ssx\Wiretap\Cli\Output;
+use Symfony\Component\Console\Output\OutputInterface;
 
 /**
  * Runs a core CLI command from inside artisan.
@@ -49,7 +50,13 @@ trait RunsCoreCommand
             $captured = stream_get_contents($stream);
 
             if (is_string($captured) && $captured !== '') {
-                $this->output->write($captured);
+                // OUTPUT_RAW, because Symfony's default write() interprets
+                // console tags. A HAR body containing <info>x</info> was
+                // replayed as plain "x" — an export silently losing content,
+                // and with decoration on it gained ANSI bytes that made the
+                // JSON invalid. The core renderer has already decided about
+                // colour.
+                $this->output->write($captured, false, OutputInterface::OUTPUT_RAW);
             }
 
             return $exitCode;

@@ -363,3 +363,108 @@ describe('resource fixes found by review', function (): void {
         expect(Wiretap::recorded())->toHaveCount(1);
     });
 });
+
+describe('second review round', function (): void {
+    it('keeps explicit blocklist entries alongside environment ones', function (): void {
+        // `+` preserves numeric keys from the left array rather than appending,
+        // so an env rule at index 0 silently deleted the user's own rule at
+        // index 0 — and that host's traffic was then recorded.
+        putenv('WIRETAP_BLOCK=env.example');
+
+        try {
+            $config = require __DIR__ . '/../config/wiretap.php';
+            $merged = array_merge($config['blocklist'], ['private.example']);
+
+            expect($merged)->toContain('env.example')
+                ->and($merged)->toContain('private.example');
+        } finally {
+            putenv('WIRETAP_BLOCK');
+        }
+    });
+
+    it('keeps a regex quantifier intact through config caching', function (): void {
+        // explode(',') split ~...[0-9]{1,3}$~ into two invalid rules, and once
+        // config is cached .env is not loaded so the runtime provider cannot
+        // compensate.
+        putenv('WIRETAP_BLOCK=~^https://p[.]test/pay/[0-9]{1,3}$~');
+
+        try {
+            $config = require __DIR__ . '/../config/wiretap.php';
+
+            expect($config['blocklist'])->toHaveCount(1);
+
+            $blocklist = new \Ssx\Wiretap\Blocklist\Blocklist([
+                new \Ssx\Wiretap\Blocklist\ArrayBlocklistProvider($config['blocklist']),
+            ]);
+
+            expect($blocklist->errors())->toBeEmpty()
+                ->and($blocklist->blocks('https://p.test/pay/12'))->toBeTrue();
+        } finally {
+            putenv('WIRETAP_BLOCK');
+        }
+    });
+
+    it('does not let console formatting eat an exported payload', function (): void {
+        // Symfony's write() interprets console tags, so a HAR body containing
+        // <info>x</info> was replayed as plain "x".
+        $sink = app(Recorder::class);
+        $sink->record(exchangeWithTaggedBody());
+        $sink->flush();
+
+        Artisan::call('wiretap:export');
+
+        expect(Artisan::output())->toContain('<info>');
+    });
+
+    it('balances correlation depth when a job throws with retries remaining', function (): void {
+        // JobExceptionOccurred fires alone in that case. Listening only to
+        // JobProcessed/JobFailed left depth at 1 forever, so every later job
+        // inherited the failed attempt's correlation.
+        $listener = app(\Ssx\Wiretap\Laravel\Queue\StartJobCorrelation::class);
+        \Ssx\Wiretap\Correlation::reset();
+
+        $job = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $job->shouldReceive('uuid')->andReturn(null);
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+        $first = \Ssx\Wiretap\Correlation::id();
+        $listener->exceptionOccurred(new \Illuminate\Queue\Events\JobExceptionOccurred('sync', $job, new RuntimeException('retry me')));
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+
+        expect(\Ssx\Wiretap\Correlation::id())->not->toBe($first);
+    });
+
+    it('does not take over an enclosing http correlation', function (): void {
+        // A sync job dispatched inside a request is part of that request.
+        // Replacing its correlation broke request-wide sampling.
+        \Ssx\Wiretap\Correlation::start('inbound-request');
+
+        $listener = app(\Ssx\Wiretap\Laravel\Queue\StartJobCorrelation::class);
+        $job = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $job->shouldReceive('uuid')->andReturn('job-uuid');
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+
+        expect(\Ssx\Wiretap\Correlation::id())->toBe('inbound-request');
+
+        $listener->processed(new \Illuminate\Queue\Events\JobProcessed('sync', $job));
+
+        // Still the request's, not reset out from under it.
+        expect(\Ssx\Wiretap\Correlation::id())->toBe('inbound-request');
+    });
+});
+
+function exchangeWithTaggedBody(): \Ssx\Wiretap\Exchange
+{
+    return new \Ssx\Wiretap\Exchange(
+        id: 'tagged', correlationId: 'c', transport: 'curl', method: 'GET',
+        uri: 'https://api.example.com/v1',
+        requestHeaders: \Ssx\Wiretap\Headers::empty(),
+        requestBody: \Ssx\Wiretap\CapturedBody::captured('{"note":"<info>literal</info>"}', contentType: 'application/json'),
+        status: 200, reason: 'OK',
+        responseHeaders: \Ssx\Wiretap\Headers::empty(),
+        responseBody: \Ssx\Wiretap\CapturedBody::none(),
+        timings: new \Ssx\Wiretap\Timings(total: 1000), error: null, startedAt: microtime(true),
+    );
+}

@@ -6,6 +6,7 @@ namespace Ssx\Wiretap\Laravel;
 
 use GuzzleHttp\Client as GuzzleClient;
 use Illuminate\Contracts\Http\Kernel;
+use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
@@ -155,6 +156,8 @@ final class WiretapServiceProvider extends ServiceProvider
         $events->listen(JobProcessing::class, [$listener, 'processing']);
         $events->listen(JobProcessed::class, [$listener, 'processed']);
         $events->listen(JobFailed::class, [$listener, 'failed']);
+        // A retryable failure emits only this one.
+        $events->listen(JobExceptionOccurred::class, [$listener, 'exceptionOccurred']);
     }
 
     private function registerCorrelationMiddleware(): void
