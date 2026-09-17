@@ -68,7 +68,10 @@ final readonly class LaravelContextEnricher implements ContextEnricher
 
             $guard = $manager->guard();
 
-            if (!is_object($guard) || !method_exists($guard, 'hasUser') || !$guard->hasUser()) {
+            if (!is_object($guard)
+                || !method_exists($guard, 'hasUser')
+                || !method_exists($guard, 'id')
+                || !$guard->hasUser()) {
                 return null;
             }
 
