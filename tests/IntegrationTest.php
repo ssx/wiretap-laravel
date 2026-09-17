@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use GuzzleHttp\Client as GuzzleClient;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
 use Ssx\Wiretap\Correlation;
@@ -292,5 +293,73 @@ describe('hardening found by review', function (): void {
         } finally {
             putenv('WIRETAP_BLOCK');
         }
+    });
+});
+
+describe('resource fixes found by review', function (): void {
+    it('gives each queued job its own correlation', function (): void {
+        // A persistent worker never reaches the HTTP middleware, so every job
+        // it handled shared one id and an ever-growing sequence — and sampling
+        // is deterministic on that id, so the worker's jobs were sampled as a
+        // single unit.
+        $listener = app(\Ssx\Wiretap\Laravel\Queue\StartJobCorrelation::class);
+
+        $job = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $job->shouldReceive('uuid')->andReturn(null);
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+        $first = \Ssx\Wiretap\Correlation::id();
+        \Ssx\Wiretap\Correlation::nextSequence();
+        \Ssx\Wiretap\Correlation::nextSequence();
+        $listener->processed(new \Illuminate\Queue\Events\JobProcessed('sync', $job));
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+        $second = \Ssx\Wiretap\Correlation::id();
+
+        expect($second)->not->toBe($first)
+            ->and(\Ssx\Wiretap\Correlation::nextSequence())->toBe(0);
+    });
+
+    it('keeps the outer correlation for a nested synchronous job', function (): void {
+        $listener = app(\Ssx\Wiretap\Laravel\Queue\StartJobCorrelation::class);
+
+        $job = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $job->shouldReceive('uuid')->andReturn(null);
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+        $outer = \Ssx\Wiretap\Correlation::id();
+
+        // A job dispatched inside another is part of the same operation.
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+
+        expect(\Ssx\Wiretap\Correlation::id())->toBe($outer);
+
+        $listener->processed(new \Illuminate\Queue\Events\JobProcessed('sync', $job));
+
+        expect(\Ssx\Wiretap\Correlation::id())->toBe($outer);
+    });
+
+    it('sends artisan output through Laravel so it can be buffered', function (): void {
+        // Writing to STDOUT meant Artisan::call() returned an empty output()
+        // and console assertions could not see anything.
+        Artisan::call('wiretap:list');
+
+        expect(Artisan::output())->toContain('No exchanges found');
+    });
+
+    it('lets the test API work when capture is disabled', function (): void {
+        // Skipping surface installation meant fake() replaced the recorder and
+        // then had nothing to record through, so assertSent() failed on
+        // traffic that had definitely happened.
+        $this->bootWith(['wiretap.enabled' => false]);
+
+        Wiretap::fake();
+
+        Http::fake(['api.example.com/*' => Http::response([], 200)]);
+        Http::get('https://api.example.com/v1/orders');
+
+        Wiretap::assertSent('api.example.com');
+
+        expect(Wiretap::recorded())->toHaveCount(1);
     });
 });
