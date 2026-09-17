@@ -1,0 +1,70 @@
+{
+    "name": "ssx/wiretap-laravel",
+    "description": "Laravel integration for wiretap. Captures outbound HTTP from the Http facade, the container's Guzzle client, and vendor code.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "laravel",
+        "http",
+        "debugging",
+        "logging",
+        "guzzle"
+    ],
+    "authors": [
+        {
+            "name": "Scott Robinson",
+            "email": "scott@dor.ky"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ssx/wiretap": "~0.0.2 || dev-main",
+        "ssx/wiretap-guzzle": "~0.0.2 || dev-main",
+        "illuminate/support": "^11.0 || ^12.0",
+        "illuminate/http": "^11.0 || ^12.0",
+        "illuminate/console": "^11.0 || ^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0 || ^10.0",
+        "pestphp/pest": "^2.34",
+        "phpstan/phpstan": "^1.11"
+    },
+    "suggest": {
+        "ssx/wiretap-auto": "Also captures raw curl_exec() and vendor-constructed Guzzle clients"
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/ssx/wiretap"
+        },
+        {
+            "type": "vcs",
+            "url": "https://github.com/ssx/wiretap-guzzle"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Ssx\\Wiretap\\Laravel\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ssx\\Wiretap\\Laravel\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Ssx\\Wiretap\\Laravel\\WiretapServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

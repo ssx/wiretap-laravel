@@ -1,0 +1,67 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Ssx\Wiretap\Laravel\Console;
+
+use Ssx\Wiretap\Cli\Application;
+
+/**
+ * Runs a core CLI command from inside artisan.
+ *
+ * These are deliberately thin. Reimplementing the rendering against Laravel's
+ * table helper would mean two implementations of every command drifting apart,
+ * and the core CLI already knows how to print an exchange. The artisan command
+ * exists so `php artisan wiretap:list` works with the app's configured path
+ * without anyone having to remember where that is.
+ */
+trait RunsCoreCommand
+{
+    /**
+     * @param list<string> $arguments
+     */
+    protected function runCore(string $command, array $arguments = []): int
+    {
+        $path = (string) config('wiretap.path');
+
+        $argv = array_merge(['wiretap', $command], $arguments, ['--path=' . $path]);
+
+        // The core Application writes to STDOUT directly, which is what we
+        // want: its colour handling and column alignment are already correct,
+        // and piping through Laravel's output would only re-wrap it.
+        return (new Application())->run($argv);
+    }
+
+    /**
+     * Pass through any option the core command understands, so the artisan
+     * wrapper never has to be updated when the core grows a filter.
+     *
+     * @param list<string> $names
+     *
+     * @return list<string>
+     */
+    protected function forwardOptions(array $names): array
+    {
+        $forwarded = [];
+
+        foreach ($names as $name) {
+            $value = $this->option($name);
+
+            if ($value === null || $value === false || $value === []) {
+                continue;
+            }
+
+            if ($value === true) {
+                $forwarded[] = "--{$name}";
+
+                continue;
+            }
+
+            // An option can arrive as an array when declared with `*`. None of
+            // ours are, but narrowing here keeps the contract honest.
+            $forwarded[] = sprintf('--%s=%s', $name, is_array($value) ? implode(',', $value) : (string) $value);
+        }
+
+        return $forwarded;
+    }
+}
