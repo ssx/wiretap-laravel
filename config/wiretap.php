@@ -43,7 +43,7 @@ return [
         PresetBlocklistProvider::CLOUD_METADATA,
     ],
 
-    'blocklist' => [
+    'blocklist' => array_filter(array_map('trim', explode(',', (string) env('WIRETAP_BLOCK', '')))) + [
         // 'internal-billing.example.com',
         // '*.myacquirer.test',
     ],

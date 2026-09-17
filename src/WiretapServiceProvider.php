@@ -60,16 +60,17 @@ final class WiretapServiceProvider extends ServiceProvider
             ]);
         }
 
+        $recorder = $this->app->make(Recorder::class);
+
+        // Publish even when disabled. Returning early left whatever the
+        // previous application put on the holder — in a worker running several
+        // applications, an enabled recorder from an earlier one kept receiving
+        // traffic under its own policy.
+        Wiretap::setRecorder($recorder);
+
         if (!config('wiretap.enabled')) {
             return;
         }
-
-        $recorder = $this->app->make(Recorder::class);
-
-        // One holder, shared with the curl hooks in ssx/wiretap-auto if that
-        // package is installed. Setting it here is what makes the hooks write
-        // to this application's configured sink rather than a default one.
-        Wiretap::setRecorder($recorder);
 
         $this->registerCorrelationMiddleware();
         $this->attachCaptureSurfaces($recorder);
@@ -161,7 +162,14 @@ final class WiretapServiceProvider extends ServiceProvider
         // Anything resolving Guzzle from the container gets a recorded client.
         // Code doing `new Client()` directly is out of reach — that is what
         // ssx/wiretap-auto exists for.
-        if (($capture['container_guzzle'] ?? true) && class_exists(GuzzleClient::class)) {
+        //
+        // Only when nothing else has bound it. An unconditional bind replaced
+        // an application's own client — base_uri, auth, timeouts, certificates,
+        // even a test mock handler — with a bare default. That can break
+        // production requests and make a test suite hit the network.
+        if (($capture['container_guzzle'] ?? true)
+            && class_exists(GuzzleClient::class)
+            && !$this->app->bound(GuzzleClient::class)) {
             $this->app->bind(GuzzleClient::class, static fn (): GuzzleClient => new GuzzleClient([
                 'handler' => Stack::wrap(static fn (): Recorder => Wiretap::recorder()),
             ]));

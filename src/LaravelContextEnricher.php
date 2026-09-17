@@ -78,7 +78,11 @@ final readonly class LaravelContextEnricher implements ContextEnricher
             'route' => method_exists($route, 'getName') ? $route->getName() : null,
             'action' => method_exists($route, 'getActionName') ? $route->getActionName() : null,
             'method' => $request->getMethod(),
-            'uri' => '/' . ltrim($request->path(), '/'),
+            // The route template, not the concrete path. `/reset-password/{token}`
+            // rather than `/reset-password/<the actual token>` — recording the
+            // real path put a credential into context, which no body-path rule
+            // can protect.
+            'uri' => '/' . ltrim(method_exists($route, 'uri') ? (string) $route->uri() : $request->path(), '/'),
             'env' => (string) $this->app->environment(),
         ];
 
