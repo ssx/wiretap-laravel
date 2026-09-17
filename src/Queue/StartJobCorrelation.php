@@ -4,90 +4,128 @@ declare(strict_types=1);
 
 namespace Ssx\Wiretap\Laravel\Queue;
 
+use Illuminate\Contracts\Queue\Job;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Ssx\Wiretap\Correlation;
+use Ssx\Wiretap\Laravel\Http\StartCorrelation;
+use Ssx\Wiretap\Wiretap;
 
 /**
  * Gives each queued job its own correlation.
  *
- * Correlation was seeded only by HTTP middleware, so in a persistent
- * queue:work process every job shared one id and an ever-growing sequence —
- * and sampling, being deterministic on that id, treated the whole worker as a
+ * Without this, a persistent queue:work process never calls start() or
+ * reset(), so every job shares one id and an ever-growing sequence — and
+ * sampling, being deterministic on that id, treats the whole worker as a
  * single unit.
  *
- * Two cases make this less trivial than it looks:
+ * Ownership is tracked per job rather than with a counter. A bare depth
+ * counter was wrong in two ways that only show up in combination:
  *
- *  - A job that throws with retries remaining emits neither JobProcessed nor
- *    JobFailed, only JobExceptionOccurred. Listening to the first two alone
- *    left the depth counter permanently unbalanced, so every later job
- *    inherited the failed attempt's correlation.
- *  - A synchronous job dispatched inside an HTTP request must not replace the
- *    request's correlation. It is part of that request, and taking it over
- *    broke request-wide sampling. Only a job with no correlation already in
- *    scope starts a new one.
+ *  - SyncQueue fires JobExceptionOccurred *and* JobFailed for the same
+ *    attempt. At depth 2 — a sync job dispatched inside another job — both
+ *    decremented, the depth hit zero early, and the *outer* job's correlation
+ *    was reset out from under it. Every later job then inherited a stale id.
+ *  - The listener asked Correlation::hasStarted() to decide whether an
+ *    enclosing scope owned the correlation, but that becomes true as soon as
+ *    anything calls Correlation::id() — which the capture middleware does on
+ *    the first outbound call. One HTTP call at boot meant no job in that
+ *    worker ever got its own correlation again.
+ *
+ * So: a stack keyed by job object, and an explicit request-scope marker.
  */
 final class StartJobCorrelation
 {
-    private int $depth = 0;
+    /** @var list<int> */
+    private array $stack = [];
 
-    private bool $startedHere = false;
+    /** @var array<int, bool> */
+    private array $owned = [];
 
     public function processing(JobProcessing $event): void
     {
-        if ($this->depth++ > 0) {
+        $id = $this->idFor($event->job);
+
+        if (isset($this->owned[$id])) {
+            // Same job seen twice without a completion event. Do not stack it
+            // again, or the matching completion can never balance.
             return;
         }
 
-        // An enclosing scope — an HTTP request, or a console command that set
-        // one — owns the correlation. A sync job inside it is part of the same
-        // operation.
-        if (Correlation::hasStarted()) {
-            $this->startedHere = false;
+        $nested = $this->stack !== [];
+        $this->stack[] = $id;
 
-            return;
+        // An enclosing scope owns the correlation: an outer job, or an HTTP
+        // request that dispatched this one synchronously. A sync job inside a
+        // request is part of that request, and taking it over broke
+        // request-wide sampling.
+        // An enclosing scope owns the correlation when an outer job holds it,
+        // an HTTP request is being handled, or something deliberately called
+        // Correlation::start(). A correlation that merely got generated on
+        // demand by the first outbound call does not count — treating it as an
+        // owner meant one HTTP call at boot silenced every job in the worker.
+        $this->owned[$id] = !$nested
+            && !StartCorrelation::isHandlingRequest()
+            && !Correlation::startedExplicitly();
+
+        if ($this->owned[$id]) {
+            Correlation::start($event->job->uuid() ?? null);
         }
-
-        $this->startedHere = true;
-        Correlation::start($event->job->uuid() ?? null);
     }
 
     public function processed(JobProcessed $event): void
     {
-        $this->finish();
+        $this->finish($event->job);
     }
 
     public function failed(JobFailed $event): void
     {
-        $this->finish();
+        $this->finish($event->job);
     }
 
     /**
-     * Fires when a job throws but may still be retried. Neither JobProcessed
-     * nor JobFailed follows it, so without this the depth never comes back
-     * down.
+     * Fires when a job throws but may still be retried, and — for the sync
+     * queue — alongside JobFailed for the same attempt.
      */
     public function exceptionOccurred(JobExceptionOccurred $event): void
     {
-        $this->finish();
+        $this->finish($event->job);
     }
 
-    private function finish(): void
+    private function finish(Job $job): void
     {
-        if ($this->depth === 0) {
-            // Already balanced — JobFailed can follow JobExceptionOccurred for
-            // the same attempt, and the second must not unwind a scope it does
-            // not own.
+        $id = $this->idFor($job);
+
+        if (!isset($this->owned[$id])) {
+            // Already completed — the second of a JobExceptionOccurred /
+            // JobFailed pair. Unwinding again would pop a scope belonging to
+            // the job outside this one.
             return;
         }
 
-        $this->depth = max(0, $this->depth - 1);
+        $owned = $this->owned[$id];
+        unset($this->owned[$id]);
 
-        if ($this->depth === 0 && $this->startedHere) {
-            Correlation::reset();
-            $this->startedHere = false;
+        $position = array_search($id, $this->stack, true);
+
+        if ($position !== false) {
+            array_splice($this->stack, $position, 1);
         }
+
+        // Flush per job. A worker otherwise held captures until 200 records, 8
+        // MiB or process exit, so someone enabling capture to debug one job
+        // ran wiretap:list and saw nothing.
+        Wiretap::recorder()->flush();
+
+        if ($owned) {
+            Correlation::reset();
+        }
+    }
+
+    private function idFor(Job $job): int
+    {
+        return spl_object_id($job);
     }
 }

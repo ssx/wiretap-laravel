@@ -321,22 +321,32 @@ describe('resource fixes found by review', function (): void {
     });
 
     it('keeps the outer correlation for a nested synchronous job', function (): void {
+        // Two distinct job objects: ownership is tracked per job, so reusing
+        // one mock would not exercise nesting at all.
         $listener = app(\Ssx\Wiretap\Laravel\Queue\StartJobCorrelation::class);
+        \Ssx\Wiretap\Correlation::reset();
 
-        $job = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
-        $job->shouldReceive('uuid')->andReturn(null);
+        $outerJob = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $outerJob->shouldReceive('uuid')->andReturn('outer-uuid');
+        $innerJob = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $innerJob->shouldReceive('uuid')->andReturn('inner-uuid');
 
-        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $outerJob));
         $outer = \Ssx\Wiretap\Correlation::id();
 
         // A job dispatched inside another is part of the same operation.
-        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $job));
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('sync', $innerJob));
 
         expect(\Ssx\Wiretap\Correlation::id())->toBe($outer);
 
-        $listener->processed(new \Illuminate\Queue\Events\JobProcessed('sync', $job));
+        // The sync queue fires both of these for the same attempt. Unwinding
+        // twice used to reset the *outer* job's scope out from under it.
+        $listener->exceptionOccurred(new \Illuminate\Queue\Events\JobExceptionOccurred('sync', $innerJob, new RuntimeException('inner failed')));
+        $listener->failed(new \Illuminate\Queue\Events\JobFailed('sync', $innerJob, new RuntimeException('inner failed')));
 
         expect(\Ssx\Wiretap\Correlation::id())->toBe($outer);
+
+        $listener->processed(new \Illuminate\Queue\Events\JobProcessed('sync', $outerJob));
     });
 
     it('sends artisan output through Laravel so it can be buffered', function (): void {
@@ -468,3 +478,63 @@ function exchangeWithTaggedBody(): \Ssx\Wiretap\Exchange
         timings: new \Ssx\Wiretap\Timings(total: 1000), error: null, startedAt: microtime(true),
     );
 }
+
+describe('fable review findings', function (): void {
+    it('treats WIRETAP_ENABLED=off as off', function (): void {
+        // Laravel's env() only converts the literal strings true/false/null,
+        // so 'off' arrived as a string and (bool) 'off' is true. Capture ran,
+        // writing full bodies to disk, while the operator believed it was off
+        // — and core's doctor, which uses filter_var, agreed with them.
+        foreach (['off', 'no', 'disabled', 'false', '0', 'nonsense'] as $value) {
+            $this->bootWith(['wiretap.enabled' => $value]);
+
+            expect(app(Recorder::class)->isEnabled())
+                ->toBeFalse("WIRETAP_ENABLED={$value} should mean off");
+        }
+    });
+
+    it('still treats the affirmative spellings as on', function (): void {
+        foreach (['true', '1', 'yes', 'on'] as $value) {
+            $this->bootWith(['wiretap.enabled' => $value]);
+
+            expect(app(Recorder::class)->isEnabled())->toBeTrue();
+        }
+    });
+
+    it('honours make() parameters on the Guzzle binding', function (): void {
+        // The closure discarded $parameters, so app(Client::class, ['config' =>
+        // [...]]) silently lost base_uri, auth and timeouts.
+        $client = app()->makeWith(GuzzleClient::class, ['config' => [
+            'base_uri' => 'https://configured.example.com',
+            'timeout' => 42,
+        ]]);
+
+        expect((string) $client->getConfig('base_uri'))->toBe('https://configured.example.com')
+            ->and($client->getConfig('timeout'))->toBe(42);
+    });
+
+    it('does not let a generated correlation silence every job in a worker', function (): void {
+        // hasStarted() becomes true as soon as the capture middleware calls
+        // id() on the first outbound call, so one HTTP call at boot meant no
+        // job ever took ownership again.
+        \Ssx\Wiretap\Correlation::reset();
+        \Ssx\Wiretap\Correlation::id(); // generated on demand, not owned
+
+        $listener = app(\Ssx\Wiretap\Laravel\Queue\StartJobCorrelation::class);
+
+        $first = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $first->shouldReceive('uuid')->andReturn('job-one');
+        $second = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $second->shouldReceive('uuid')->andReturn('job-two');
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('redis', $first));
+        $a = \Ssx\Wiretap\Correlation::id();
+        $listener->processed(new \Illuminate\Queue\Events\JobProcessed('redis', $first));
+
+        $listener->processing(new \Illuminate\Queue\Events\JobProcessing('redis', $second));
+        $b = \Ssx\Wiretap\Correlation::id();
+
+        expect($a)->toBe('job-one')
+            ->and($b)->toBe('job-two');
+    });
+});
