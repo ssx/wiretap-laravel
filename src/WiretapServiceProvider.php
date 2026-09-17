@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ssx\Wiretap\Laravel;
 
 use GuzzleHttp\Client as GuzzleClient;
+use GuzzleHttp\HandlerStack;
 use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
@@ -78,6 +79,14 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->registerCorrelationMiddleware();
         $this->registerQueueCorrelation();
 
+        // Octane runs terminating callbacks per request, and a queue worker
+        // per job. Without this the recorder flushed only at 200 records, 8
+        // MiB, or process exit — so someone enabling capture to debug a job
+        // ran wiretap:list, saw nothing, and concluded the tool was broken.
+        $this->app->terminating(static function (): void {
+            Wiretap::recorder()->flush();
+        });
+
         // Surfaces are attached even when capture is disabled.
         //
         // They resolve the recorder per call, and a disabled recorder records
@@ -90,11 +99,34 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->attachCaptureSurfaces();
     }
 
+    /**
+     * Interpret a configured boolean the way an operator means it.
+     *
+     * Laravel's env() only converts the literal strings true/false/null/empty,
+     * so WIRETAP_ENABLED=off arrived as the string 'off' — and (bool) 'off' is
+     * true. Capture ran, writing complete request and response bodies to disk,
+     * while the operator believed they had turned it off. Core's own doctor
+     * uses filter_var and printed "false" at the same time, so the diagnostic
+     * agreed with them.
+     *
+     * Anything filter_var cannot interpret is treated as false: for a switch
+     * that governs recording personal data, an unrecognised value must not
+     * mean on.
+     */
+    private static function truthy(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        return filter_var($value, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? false;
+    }
+
     private function buildRecorder(): Recorder
     {
         /** @var array<string, mixed> $config */
         $config = config('wiretap');
-        $enabled = (bool) ($config['enabled'] ?? false);
+        $enabled = self::truthy($config['enabled'] ?? false);
 
         /** @var array<string, mixed> $redaction */
         $redaction = $config['redaction'] ?? [];
@@ -105,7 +137,7 @@ final class WiretapServiceProvider extends ServiceProvider
                 : new NullSink(),
             blocklist: $this->buildBlocklist($config),
             redactor: new Redactor(new RedactionConfig(
-                enabled: (bool) ($redaction['enabled'] ?? true),
+                enabled: self::truthy($redaction['enabled'] ?? true),
                 bodyPaths: array_values((array) ($redaction['body_paths'] ?? [])),
                 maxBodyBytes: (int) ($redaction['max_body_bytes'] ?? 65536),
             )),
@@ -204,9 +236,30 @@ final class WiretapServiceProvider extends ServiceProvider
         if (($capture['container_guzzle'] ?? true)
             && class_exists(GuzzleClient::class)
             && !$this->app->bound(GuzzleClient::class)) {
-            $this->app->bind(GuzzleClient::class, static fn (): GuzzleClient => new GuzzleClient([
-                'handler' => Stack::wrap(static fn (): Recorder => Wiretap::recorder()),
-            ]));
+            $this->app->bind(
+                GuzzleClient::class,
+                /**
+                 * @param array<string, mixed> $parameters
+                 */
+                static function ($app, array $parameters = []): GuzzleClient {
+                    // Honour make()/makeWith() parameters. Discarding them
+                    // meant app(Client::class, ['config' => [...]]) silently
+                    // lost base_uri, auth and timeouts that had previously
+                    // been passed straight to the constructor.
+                    /** @var array<string, mixed> $config */
+                    $config = is_array($parameters['config'] ?? null) ? $parameters['config'] : [];
+
+                    $resolver = static fn (): Recorder => Wiretap::recorder();
+
+                    // Attach to a handler the caller supplied rather than
+                    // replacing it.
+                    $config['handler'] = isset($config['handler']) && $config['handler'] instanceof HandlerStack
+                        ? Stack::attach($config['handler'], $resolver)
+                        : Stack::wrap($resolver);
+
+                    return new GuzzleClient($config);
+                },
+            );
         }
     }
 }
