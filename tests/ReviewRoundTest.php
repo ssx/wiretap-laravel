@@ -311,44 +311,67 @@ describe('sampling key', function (): void {
     });
 
     it('makes an offline-computed correlation id useless', function (): void {
-        // End to end: an id computed to be sampled in under the unsalted
-        // algorithm does not get that outcome once the app key is the key.
-        $rate = 100;
-        $chosen = null;
-
-        for ($i = 0; $i < 100_000; ++$i) {
-            if ((crc32("chosen-{$i}") % 10000) < $rate) {
-                $chosen = "chosen-{$i}";
-
-                break;
-            }
-        }
-
-        $exchange = new Ssx\Wiretap\Exchange(
-            id: 'x',
-            correlationId: (string) $chosen,
-            transport: 'guzzle',
-            method: 'GET',
-            uri: 'https://api.example.com/v1',
-            requestHeaders: Ssx\Wiretap\Headers::empty(),
-            requestBody: Ssx\Wiretap\CapturedBody::none(),
-            status: 200,
-            reason: 'OK',
-            responseHeaders: Ssx\Wiretap\Headers::empty(),
-            responseBody: Ssx\Wiretap\CapturedBody::none(),
-            timings: new Ssx\Wiretap\Timings(total: 1),
-            error: null,
-            startedAt: 1.0,
-        );
+        // End to end, stated as the property rather than as one outcome.
+        //
+        // A single id is not a test: at a 1% rate the salted key lands in the
+        // sampled-in bucket 1% of the time by chance, so asserting one id is
+        // dropped passes 99 runs in 100 and fails the hundredth. CI found that
+        // on a random app key before this was rewritten.
+        //
+        // What actually matters is that computing an id offline buys nothing:
+        // of many ids chosen to be sampled IN under the unsalted algorithm,
+        // the salted sampler keeps only about the base rate of them.
+        $rate = 100; // 1%
+        $salt = 'fixed-for-determinism';
 
         $unsalted = new Ssx\Wiretap\Sampler(rateBasisPoints: $rate, alwaysKeepFailures: false);
         $salted = new Ssx\Wiretap\Sampler(
             rateBasisPoints: $rate,
             alwaysKeepFailures: false,
-            samplingSalt: (string) config('app.key'),
+            samplingSalt: $salt,
         );
 
-        expect($unsalted->shouldKeep($exchange))->toBeTrue()
-            ->and($salted->shouldKeep($exchange))->toBeFalse();
+        $chosen = [];
+
+        for ($i = 0; count($chosen) < 200 && $i < 1_000_000; ++$i) {
+            if ((crc32("chosen-{$i}") % 10000) < $rate) {
+                $chosen[] = "chosen-{$i}";
+            }
+        }
+
+        expect($chosen)->toHaveCount(200);
+
+        $unsaltedKept = 0;
+        $saltedKept = 0;
+
+        foreach ($chosen as $id) {
+            $exchange = new Ssx\Wiretap\Exchange(
+                id: 'x',
+                correlationId: $id,
+                transport: 'guzzle',
+                method: 'GET',
+                uri: 'https://api.example.com/v1',
+                requestHeaders: Ssx\Wiretap\Headers::empty(),
+                requestBody: Ssx\Wiretap\CapturedBody::none(),
+                status: 200,
+                reason: 'OK',
+                responseHeaders: Ssx\Wiretap\Headers::empty(),
+                responseBody: Ssx\Wiretap\CapturedBody::none(),
+                timings: new Ssx\Wiretap\Timings(total: 1),
+                error: null,
+                startedAt: 1.0,
+            );
+
+            $unsaltedKept += $unsalted->shouldKeep($exchange) ? 1 : 0;
+            $saltedKept += $salted->shouldKeep($exchange) ? 1 : 0;
+        }
+
+        // Every one of them, by construction — the attacker's computation is
+        // exactly right when there is no salt.
+        expect($unsaltedKept)->toBe(200)
+            // And worth no more than chance once there is one. ~2 expected at
+            // 1%; 40 is a generous ceiling that still fails loudly if the salt
+            // were ignored.
+            ->and($saltedKept)->toBeLessThan(40);
     });
 });
