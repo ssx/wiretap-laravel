@@ -9,6 +9,7 @@ use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Jobs\SyncJob;
 use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Laravel\Http\StartCorrelation;
 use Ssx\Wiretap\Wiretap;
@@ -88,9 +89,22 @@ final class StartJobCorrelation
     /**
      * Fires when a job throws but may still be retried, and — for the sync
      * queue — alongside JobFailed for the same attempt.
+     *
+     * A sync job is left alone here. SyncQueue raises this event, then calls
+     * fail(), which invokes the job's own failed() callback and only then
+     * raises JobFailed — so finishing on this event reset the correlation
+     * before failed() ran. A failure-notification HTTP call made from there
+     * got a fresh unrelated id and dropped out of the trace, and the
+     * JobFailed that followed skipped flushing those captures because
+     * ownership had already been given up. For a sync job a JobFailed always
+     * follows, so deferring to it loses nothing.
      */
     public function exceptionOccurred(JobExceptionOccurred $event): void
     {
+        if ($event->job instanceof SyncJob) {
+            return;
+        }
+
         $this->finish($event->job);
     }
 
@@ -114,14 +128,21 @@ final class StartJobCorrelation
             array_splice($this->stack, $position, 1);
         }
 
+        if (!$owned) {
+            // An enclosing scope — a request, or an outer job — owns this one
+            // and will flush when it ends. Flushing here put a synchronous
+            // NdjsonFileSink write on the request path for every job
+            // dispatched with dispatchSync() from a controller, which is
+            // exactly what core's Recorder warns against.
+            return;
+        }
+
         // Flush per job. A worker otherwise held captures until 200 records, 8
         // MiB or process exit, so someone enabling capture to debug one job
         // ran wiretap:list and saw nothing.
         Wiretap::recorder()->flush();
 
-        if ($owned) {
-            Correlation::reset();
-        }
+        Correlation::reset();
     }
 
     private function idFor(Job $job): int
