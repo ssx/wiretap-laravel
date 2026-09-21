@@ -100,9 +100,23 @@ capture surfaces, storage path and retention. Every value is annotated.
 The two worth setting for your project:
 
 ```php
-'blocklist' => ['*.myacquirer.test'],          // never recorded at all
-'redaction' => ['body_paths' => ['card.cvv']], // recorded, but redacted
+'blocklist' => array_merge(
+    // Keep this. Once the config is cached Laravel stops loading .env, so
+    // without it WIRETAP_BLOCK becomes a no-op in exactly the deployments
+    // most likely to have capture switched on.
+    EnvBlocklistProvider::parse((string) env('WIRETAP_BLOCK', '')),
+    ['*.myacquirer.test'],                     // never recorded at all
+),
+
+'redaction' => [
+    'body_paths' => ['card.cvv'],              // recorded, but redacted
+    'headers' => ['X-Partner-Secret'],         // added to the defaults, not replacing them
+],
 ```
+
+Editing the published config replaces the array it appears in, which is why
+the `array_merge` above matters — writing `'blocklist' => ['*.myacquirer.test']`
+on its own silently drops the env blocklist.
 
 Wiretap cannot know which of your endpoints carry cardholder data or which
 keys in your payloads are sensitive. You do.

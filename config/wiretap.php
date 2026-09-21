@@ -85,6 +85,55 @@ return [
         ],
 
         'max_body_bytes' => env('WIRETAP_BODY_LIMIT', 65536),
+
+        /*
+        | Everything below is added to what core already redacts, not
+        | substituted for it. Naming one extra sensitive header should not
+        | silently stop Authorization and Cookie being removed.
+        */
+
+        // Extra header names to remove, on top of Authorization, Cookie,
+        // Set-Cookie, X-Api-Key and the rest.
+        'headers' => [
+            // 'X-Partner-Secret',
+        ],
+
+        // Extra query parameter names, on top of api_key, token, signature...
+        'query' => [
+            // 'session',
+        ],
+
+        // 'deny' removes the named headers. 'allow' keeps only them, which is
+        // stricter and much more likely to omit something you wanted.
+        'header_mode' => env('WIRETAP_HEADER_MODE', 'deny'),
+
+        // Built-in detectors. Turning one off does not drop those values into
+        // the record wholesale — the safety net respects this same set, so a
+        // disabled detector is genuinely disabled rather than making things
+        // worse. `email` is off by default because it false-positives on
+        // ordinary prose.
+        'patterns' => [
+            // 'email' => true,
+        ],
+
+        // Extra regexes, applied as-is to header values and bodies.
+        'custom' => [
+            // '/\bacct_[A-Za-z0-9]{16}\b/',
+        ],
+
+        // The last line of defence: re-run the enabled detectors over the
+        // finished record and drop the body entirely on a hit. Leave it on.
+        'safety_net' => env('WIRETAP_SAFETY_NET', true),
+
+        // A body the structured rules could not parse is omitted rather than
+        // stored unredacted.
+        'omit_uninspectable_bodies' => true,
+
+        'max_header_value_bytes' => env('WIRETAP_HEADER_LIMIT', 4096),
+
+        // Shorter echoed values are not swept from response bodies, because a
+        // short token corrupts unrelated prose wherever it happens to appear.
+        'min_echoed_secret_length' => 8,
     ],
 
     /*

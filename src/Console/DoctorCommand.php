@@ -38,6 +38,22 @@ final class DoctorCommand extends Command
         $this->row('Http facade', ($capture['http_client'] ?? true) ? 'captured' : 'off', (bool) ($capture['http_client'] ?? true));
         $this->row('container Guzzle', ($capture['container_guzzle'] ?? true) ? 'captured' : 'off', (bool) ($capture['container_guzzle'] ?? true));
 
+        // Where records land, and whether the webserver will serve them.
+        //
+        // The 0600 files and 0700 directory the sink creates protect against
+        // *other users* on the box. The webserver runs as the same user, so a
+        // path under public/ is simply downloadable — complete request and
+        // response bodies, by URL, to anyone.
+        $path = WiretapServiceProvider::path((array) config('wiretap', []));
+        $public = $this->publicPath();
+        $exposed = $public !== null && str_starts_with($this->real($path), $public);
+
+        $this->row(
+            'log path',
+            $exposed ? $path . ' — INSIDE the web root, served to anyone' : $path,
+            !$exposed,
+        );
+
         $auto = class_exists(\Ssx\Wiretap\Auto\Wiretap::class);
         $this->row(
             'vendor code & raw curl',
@@ -65,5 +81,30 @@ final class DoctorCommand extends Command
             $label,
             $value,
         ));
+    }
+
+    /**
+     * The document root, resolved, or null when there is not one.
+     */
+    private function publicPath(): ?string
+    {
+        if (!function_exists('public_path')) {
+            return null;
+        }
+
+        $public = $this->real(public_path());
+
+        return $public === '' ? null : $public;
+    }
+
+    /**
+     * realpath() where it resolves, the given path otherwise — a directory
+     * that does not exist yet is still worth checking.
+     */
+    private function real(string $path): string
+    {
+        $resolved = realpath($path);
+
+        return is_string($resolved) ? $resolved : rtrim($path, '/');
     }
 }
