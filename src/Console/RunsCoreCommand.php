@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ssx\Wiretap\Laravel\Console;
 
 use Ssx\Wiretap\Cli\Application;
+use Ssx\Wiretap\Laravel\WiretapServiceProvider;
 use Ssx\Wiretap\Cli\Output;
 use Symfony\Component\Console\Output\OutputInterface;
 
@@ -24,7 +25,13 @@ trait RunsCoreCommand
      */
     protected function runCore(string $command, array $arguments = []): int
     {
-        $path = (string) config('wiretap.path');
+        // The same resolution the sink uses.
+        //
+        // A raw cast turned a blank configured path into '', which core does
+        // not treat as absent — `--path=` is not null — so the recorder wrote
+        // to its default directory while every artisan command read an empty
+        // one and reported no exchanges.
+        $path = WiretapServiceProvider::path((array) config('wiretap', []));
         $argv = array_merge(['wiretap', $command], $arguments, ['--path=' . $path]);
 
         // Capture the core CLI's output and replay it through Laravel's.

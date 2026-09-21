@@ -22,8 +22,21 @@ final class ExportCommand extends Command
 
     public function handle(): int
     {
-        return $this->runCore('export', $this->forwardOptions([
+        $status = $this->runCore('export', $this->forwardOptions([
             'host', 'status', 'failed', 'since', 'limit', 'out',
         ]));
+
+        // A HAR holds the same complete request and response bodies the capture
+        // files do, and those are written 0600 into a 0700 directory for a
+        // reason. The export landed at whatever the umask allowed — 0644 on a
+        // default umask — in the working directory, which for artisan is the
+        // deploy root. Every account on the box could read it.
+        $out = $this->option('out');
+
+        if ($status === self::SUCCESS && is_string($out) && $out !== '' && is_file($out)) {
+            @chmod($out, 0600);
+        }
+
+        return $status;
     }
 }

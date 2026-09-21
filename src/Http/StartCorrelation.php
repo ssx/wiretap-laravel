@@ -36,12 +36,19 @@ final class StartCorrelation
             $this->firstHeader($request, ['traceparent', 'X-Request-Id', 'X-Correlation-Id'])
         );
 
+        $previous = self::$handling;
         self::$handling = true;
 
         try {
             return $next($request);
         } finally {
-            self::$handling = false;
+            // Restored, not forced false. A package that re-enters
+            // Kernel::handle() for a sub-request — multi-tenant routing, an
+            // API gateway — left the outer request marked "not handling", so a
+            // job dispatched later in that outer request took ownership of the
+            // correlation and the request's remaining calls got a third,
+            // unrelated id.
+            self::$handling = $previous;
         }
     }
 

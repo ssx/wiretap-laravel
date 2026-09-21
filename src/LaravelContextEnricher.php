@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 namespace Ssx\Wiretap\Laravel;
 
-use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Container\Container;
 use Ssx\Wiretap\Contract\ContextEnricher;
+use Ssx\Wiretap\Laravel\Http\StartCorrelation;
 use Ssx\Wiretap\Exchange;
 
 /**
@@ -18,8 +19,20 @@ use Ssx\Wiretap\Exchange;
  */
 final readonly class LaravelContextEnricher implements ContextEnricher
 {
-    public function __construct(private Application $app)
+    /**
+     * The container serving the call being recorded.
+     *
+     * Not the one captured when this enricher was constructed. Octane serves
+     * each request from a sandbox clone and binds `request` on the clone, so
+     * the boot-time container never sees it: every record came out tagged with
+     * the boot request's context — in practice `command: octane:start` and no
+     * route at all — which is the whole thing this class exists to provide.
+     * A stale `auth` guard could likewise attribute one request's user to
+     * another request's traffic.
+     */
+    private function container(): Container
     {
+        return Container::getInstance();
     }
 
     public function enrich(Exchange $exchange): Exchange
@@ -53,22 +66,31 @@ final readonly class LaravelContextEnricher implements ContextEnricher
      * __call(), so method_exists() was always false and the advertised user_id
      * was never captured at all.
      */
-    private function resolvedUserId(): string|int|null
+    private function resolvedUserId(): ?int
     {
-        if (!$this->app->bound('auth')) {
+        if (!$this->container()->bound('auth')) {
             return null;
         }
 
         try {
-            $manager = $this->app->make('auth');
+            $manager = $this->container()->make('auth');
 
             if (!is_object($manager) || !method_exists($manager, 'guard')) {
                 return null;
             }
 
-            $guard = $manager->guard();
+            // Only a guard the application has already built.
+            //
+            // Calling guard() constructs one and AuthManager caches it, so
+            // enrichment could create the guard before the application was
+            // ready to — a custom guard factory that reads request or tenant
+            // state got built with whatever was set at the time of the first
+            // outbound call, and the application then kept using that cached
+            // instance. Instrumentation is not allowed to decide when a
+            // guard comes into existence.
+            $guard = self::resolvedGuard($manager);
 
-            if (!is_object($guard)
+            if ($guard === null
                 || !method_exists($guard, 'hasUser')
                 || !method_exists($guard, 'id')
                 || !$guard->hasUser()) {
@@ -77,10 +99,48 @@ final readonly class LaravelContextEnricher implements ContextEnricher
 
             $id = $guard->id();
 
-            return is_string($id) || is_int($id) ? $id : null;
+            // Integers only.
+            //
+            // A string identifier is whatever the model's primary key is, and
+            // email-as-primary-key is a real pattern — so `user_id` became
+            // "alice@example.com", a direct identifier in plaintext in every
+            // record. Core's email detector is off by default and this bridge
+            // exposes no way to turn it on, so nothing downstream removed it
+            // either. The README promises a user id; an id is what this
+            // returns.
+            return is_int($id) ? $id : null;
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    /**
+     * A guard the application has already instantiated, or null.
+     *
+     * AuthManager exposes no way to ask, so its cache is read directly. Read
+     * only, and a failure here just means no user id on the record.
+     */
+    private static function resolvedGuard(object $manager): ?object
+    {
+        try {
+            $property = new \ReflectionProperty($manager, 'guards');
+            $property->setAccessible(true);
+            $guards = $property->getValue($manager);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        if (!is_array($guards)) {
+            return null;
+        }
+
+        foreach ($guards as $guard) {
+            if (is_object($guard)) {
+                return $guard;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -88,11 +148,30 @@ final readonly class LaravelContextEnricher implements ContextEnricher
      */
     private function consoleContext(): array
     {
+        // The command name only under the CLI SAPI.
+        //
+        // requestContext() returns nothing whenever no route matched, which
+        // includes a 404 and any outbound call made before routing — so this
+        // ran under the web SAPI too. And there PHP populates $_SERVER['argv']
+        // from the query string, split on '+', whenever register_argc_argv is
+        // on. That is the compiled-in default, active on any image shipping no
+        // php.ini, the official php-fpm ones included:
+        //
+        //   GET /missing?q=aB3+xYz9qQ==   ->   argv = ["q=aB3", "xYz9qQ=="]
+        //
+        // which persisted half a caller-supplied token as `context.command`,
+        // under a key nobody would think to look at.
+        if (PHP_SAPI !== 'cli') {
+            return array_filter([
+                'env' => (string) $this->container()->make('app')->environment(),
+            ], static fn (mixed $v): bool => $v !== '');
+        }
+
         $argv = $_SERVER['argv'] ?? [];
 
         return array_filter([
             'command' => is_array($argv) && count($argv) > 1 ? (string) $argv[1] : null,
-            'env' => (string) $this->app->environment(),
+            'env' => (string) $this->container()->make('app')->environment(),
         ], static fn (mixed $v): bool => $v !== null && $v !== '');
     }
 
@@ -101,12 +180,24 @@ final readonly class LaravelContextEnricher implements ContextEnricher
      */
     private function requestContext(): array
     {
-        if (!$this->app->bound('request')) {
+        if (!$this->container()->bound('request')) {
+            return [];
+        }
+
+        // Only while a request is actually being handled.
+        //
+        // The container keeps the last request, and its matched route, long
+        // after the response has gone. Every outbound call made afterwards was
+        // therefore tagged with that route — harmless under FPM, but under
+        // Octane it meant each inter-request call, and each job run in the same
+        // worker, was attributed to whichever request happened to run before
+        // it.
+        if (!StartCorrelation::isHandlingRequest()) {
             return [];
         }
 
         /** @var \Illuminate\Http\Request $request */
-        $request = $this->app->make('request');
+        $request = $this->container()->make('request');
         $route = $request->route();
 
         // No matched route means this is not an HTTP request being handled —
@@ -124,7 +215,7 @@ final readonly class LaravelContextEnricher implements ContextEnricher
             // real path put a credential into context, which no body-path rule
             // can protect.
             'uri' => '/' . ltrim(method_exists($route, 'uri') ? (string) $route->uri() : $request->path(), '/'),
-            'env' => (string) $this->app->environment(),
+            'env' => (string) $this->container()->make('app')->environment(),
         ];
 
         // Resolving the user forces a session and a database query on routes
