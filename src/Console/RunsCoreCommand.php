@@ -21,9 +21,10 @@ use Symfony\Component\Console\Output\OutputInterface;
 trait RunsCoreCommand
 {
     /**
-     * @param list<string> $arguments
+     * @param list<string> $arguments  Options, forwarded as written
+     * @param list<string> $positional Values, passed after `--`
      */
-    protected function runCore(string $command, array $arguments = []): int
+    protected function runCore(string $command, array $arguments = [], array $positional = []): int
     {
         // The same resolution the sink uses.
         //
@@ -32,7 +33,18 @@ trait RunsCoreCommand
         // to its default directory while every artisan command read an empty
         // one and reported no exchanges.
         $path = WiretapServiceProvider::path((array) config('wiretap', []));
+        // Positionals go last, after a `--`.
+        //
+        // A correlation id beginning with a dash was otherwise read as a short
+        // option cluster: `wiretap:trace -abc` reported "Which correlation?"
+        // for an argument that had been supplied. Ids come from inbound
+        // headers and core keeps a leading dash when it normalises one, so
+        // this was reachable rather than theoretical.
         $argv = array_merge(['wiretap', $command], $arguments, ['--path=' . $path]);
+
+        if ($positional !== []) {
+            $argv = array_merge($argv, ['--'], $positional);
+        }
 
         // Capture the core CLI's output and replay it through Laravel's.
         //

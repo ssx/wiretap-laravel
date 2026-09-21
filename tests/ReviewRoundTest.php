@@ -222,3 +222,60 @@ describe('prune', function (): void {
         $this->artisan('wiretap:prune --dry-run')->assertExitCode(0);
     });
 });
+
+describe('artisan argument forwarding', function (): void {
+    it('traces a correlation id that begins with a dash', function (): void {
+        // The id was forwarded as a bare positional and core's parser read it
+        // as a short option cluster, so the command answered "Which
+        // correlation?" for an argument that had been supplied. Ids come from
+        // inbound headers, and core keeps a leading dash when it normalises
+        // one.
+        $recorder = app(Ssx\Wiretap\Recorder::class);
+        $recorder->record(new Ssx\Wiretap\Exchange(
+            id: 'x',
+            correlationId: '-abc',
+            transport: 'guzzle',
+            method: 'GET',
+            uri: 'https://api.example.com/dashes',
+            requestHeaders: Ssx\Wiretap\Headers::empty(),
+            requestBody: Ssx\Wiretap\CapturedBody::none(),
+            status: 200,
+            reason: 'OK',
+            responseHeaders: Ssx\Wiretap\Headers::empty(),
+            responseBody: Ssx\Wiretap\CapturedBody::none(),
+            timings: new Ssx\Wiretap\Timings(total: 1),
+            error: null,
+            startedAt: microtime(true),
+        ));
+        $recorder->flush();
+
+        $this->artisan('wiretap:trace', ['correlation' => '-abc'])
+            ->assertExitCode(0)
+            ->expectsOutputToContain('dashes');
+    });
+
+    it('still traces an ordinary correlation id', function (): void {
+        $recorder = app(Ssx\Wiretap\Recorder::class);
+        $recorder->record(new Ssx\Wiretap\Exchange(
+            id: 'y',
+            correlationId: 'plain-id',
+            transport: 'guzzle',
+            method: 'GET',
+            uri: 'https://api.example.com/plain',
+            requestHeaders: Ssx\Wiretap\Headers::empty(),
+            requestBody: Ssx\Wiretap\CapturedBody::none(),
+            status: 200,
+            reason: 'OK',
+            responseHeaders: Ssx\Wiretap\Headers::empty(),
+            responseBody: Ssx\Wiretap\CapturedBody::none(),
+            timings: new Ssx\Wiretap\Timings(total: 1),
+            error: null,
+            startedAt: microtime(true),
+        ));
+        $recorder->flush();
+
+        $this->artisan('wiretap:trace', ['correlation' => 'plain-id'])
+            ->assertExitCode(0)
+            ->expectsOutputToContain('plain');
+    });
+});
