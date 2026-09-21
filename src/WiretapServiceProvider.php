@@ -6,14 +6,18 @@ namespace Ssx\Wiretap\Laravel;
 
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\HandlerStack;
+use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\ServiceProvider;
 use Ssx\Wiretap\Blocklist\ArrayBlocklistProvider;
+use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Blocklist\Blocklist;
 use Ssx\Wiretap\Blocklist\EnvBlocklistProvider;
 use Ssx\Wiretap\Blocklist\PresetBlocklistProvider;
@@ -47,7 +51,7 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->app->singleton(StartJobCorrelation::class);
 
         $this->app->singleton(NdjsonReader::class, fn (): NdjsonReader => new NdjsonReader(
-            (string) config('wiretap.path'),
+            self::path((array) config('wiretap', [])),
         ));
     }
 
@@ -74,10 +78,19 @@ final class WiretapServiceProvider extends ServiceProvider
         // previous application put on the holder — in a worker running several
         // applications, an enabled recorder from an earlier one kept receiving
         // traffic under its own policy.
-        Wiretap::setRecorder($recorder);
+        //
+        // Except while a fake is active. setRecorder() clears it, so a host
+        // test doing Wiretap::fake() and then refreshApplication() — or the
+        // bootWith() helper in this package's own TestCase — silently lost its
+        // double, and the next assertion failed with "Wiretap::fake() must be
+        // called before assertions" about traffic that had definitely happened.
+        if (!Wiretap::isFaked()) {
+            Wiretap::setRecorder($recorder);
+        }
 
         $this->registerCorrelationMiddleware();
         $this->registerQueueCorrelation();
+        $this->registerConsoleCorrelation();
 
         // Octane runs terminating callbacks per request, and a queue worker
         // per job. Without this the recorder flushed only at 200 records, 8
@@ -85,6 +98,25 @@ final class WiretapServiceProvider extends ServiceProvider
         // ran wiretap:list, saw nothing, and concluded the tool was broken.
         $this->app->terminating(static function (): void {
             Wiretap::recorder()->flush();
+
+            // Then end the request's correlation scope.
+            //
+            // Correlation::start() marks the id as explicitly owned, which the
+            // queue listener reads as "an enclosing scope owns this". Nothing
+            // cleared it, so in any process that serves a request and then does
+            // other work — Octane, or a job dispatched from a terminating
+            // callback — every job afterwards declined ownership and inherited
+            // that request's id, forever: one id, one ever-growing sequence,
+            // the wrong route on every record, and one sampling decision for
+            // the whole process.
+            //
+            // Here rather than in the middleware's terminate(): the middleware
+            // is prepended, and Kernel::terminateMiddleware() walks the list in
+            // order, so resetting there ran before every other terminable
+            // middleware. An application shipping metrics over HTTP from one of
+            // those would have had each call given a fresh, unrelated id.
+            // app()->terminate() runs after all of them.
+            Correlation::reset();
         });
 
         // Surfaces are attached even when capture is disabled.
@@ -113,13 +145,30 @@ final class WiretapServiceProvider extends ServiceProvider
      * that governs recording personal data, an unrecognised value must not
      * mean on.
      */
-    private static function truthy(mixed $value): bool
+    public static function truthy(mixed $value): bool
     {
         if (is_bool($value)) {
             return $value;
         }
 
         return filter_var($value, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? false;
+    }
+
+    /**
+     * The configured log directory, never an empty string.
+     *
+     * A missing or blank path used to become "" through a (string) cast, and
+     * the sink then quietly wrote nowhere — capture appeared to be on and
+     * produced no records. Falling back to core's own default keeps the two
+     * halves of the package agreeing about where records live.
+     *
+     * @param array<string, mixed> $config
+     */
+    public static function path(array $config): string
+    {
+        $path = $config['path'] ?? null;
+
+        return is_string($path) && trim($path) !== '' ? $path : Wiretap::defaultLogPath();
     }
 
     private function buildRecorder(): Recorder
@@ -131,9 +180,18 @@ final class WiretapServiceProvider extends ServiceProvider
         /** @var array<string, mixed> $redaction */
         $redaction = $config['redaction'] ?? [];
 
+        // Every key is read with a default.
+        //
+        // mergeConfigFrom() is skipped entirely once the application has run
+        // config:cache, so a config/wiretap.php published from an earlier
+        // version of this package is used exactly as it is — missing keys and
+        // all. Reading one directly then raised "Undefined array key", which
+        // Laravel's error handler turns into an ErrorException, thrown from
+        // inside register(). An observability package must not be able to stop
+        // the application from booting.
         $recorder = new Recorder(
             sink: $enabled
-                ? new NdjsonFileSink((string) $config['path'])
+                ? new NdjsonFileSink(self::path($config))
                 : new NullSink(),
             blocklist: $this->buildBlocklist($config),
             redactor: new Redactor(new RedactionConfig(
@@ -144,14 +202,14 @@ final class WiretapServiceProvider extends ServiceProvider
             sampler: new Sampler(
                 rateBasisPoints: (int) ($config['sample_rate_basis_points'] ?? 10000),
                 alwaysKeepFailures: (bool) ($config['always_keep_failures'] ?? true),
-                slowThresholdUs: $config['slow_threshold_us'] === null
+                slowThresholdUs: ($config['slow_threshold_us'] ?? null) === null
                     ? null
                     : (int) $config['slow_threshold_us'],
             ),
             enabled: $enabled,
         );
 
-        return $recorder->addEnricher(new LaravelContextEnricher($this->app));
+        return $recorder->addEnricher(new LaravelContextEnricher());
     }
 
     /**
@@ -160,16 +218,61 @@ final class WiretapServiceProvider extends ServiceProvider
     private function buildBlocklist(array $config): Blocklist
     {
         return new Blocklist([
-            new PresetBlocklistProvider(array_values((array) ($config['presets'] ?? []))),
+            // Falls back to the payment-gateway preset, not to nothing. Every
+            // other key here falls back to its safe value; an absent presets
+            // key silently emptying the gate would be the one exception, and
+            // the wrong way round.
+            new PresetBlocklistProvider(array_values(
+                (array) ($config['presets'] ?? [PresetBlocklistProvider::PAYMENT_GATEWAYS]),
+            )),
             new ArrayBlocklistProvider(
-                array_values(array_filter(
-                    (array) ($config['blocklist'] ?? []),
-                    static fn (mixed $p): bool => is_string($p) && trim($p) !== '',
-                )),
+                self::blocklistEntries((array) ($config['blocklist'] ?? [])),
                 'config:wiretap.blocklist',
             ),
             new EnvBlocklistProvider(),
         ]);
+    }
+
+    /**
+     * The configured blocklist entries, or a refusal.
+     *
+     * Entries used to be filtered to strings and anything else dropped in
+     * silence. The natural typo is a bracket where array_merge belongs:
+     *
+     *     'blocklist' => [ EnvBlocklistProvider::parse(env('WIRETAP_BLOCK')), '*.acquirer.test' ],
+     *
+     * whose first element is an array. That entry vanished, Blocklist::errors()
+     * stayed empty, and doctor showed a green tick — while the acquirer rule
+     * the operator believed was protecting them did not exist. A gate failing
+     * open without saying so is the worst outcome available here.
+     *
+     * Nested arrays are flattened, because that typo has an obvious intent.
+     * Anything else throws, which makes core fail closed and block everything
+     * until it is fixed. Loud and safe beats quiet and wrong for a control
+     * whose job is keeping cardholder data out of the capture.
+     *
+     * @param  array<array-key, mixed> $entries
+     * @return list<string>
+     */
+    private static function blocklistEntries(array $entries): array
+    {
+        $flat = [];
+
+        array_walk_recursive($entries, static function (mixed $entry) use (&$flat): void {
+            if (!is_string($entry)) {
+                throw new \InvalidArgumentException(sprintf(
+                    'wiretap.blocklist entries must be strings, found %s. '
+                    . 'Blocking all traffic until this is corrected.',
+                    get_debug_type($entry),
+                ));
+            }
+
+            if (trim($entry) !== '') {
+                $flat[] = $entry;
+            }
+        });
+
+        return $flat;
     }
 
     /**
@@ -192,6 +295,41 @@ final class WiretapServiceProvider extends ServiceProvider
         $events->listen(JobExceptionOccurred::class, [$listener, 'exceptionOccurred']);
     }
 
+    /**
+     * One correlation per artisan command, and a flush when it ends.
+     *
+     * There was no console lifecycle at all: only HTTP and queue. So every
+     * command in a process shared one id and one sampling decision —
+     * `schedule:run` made every scheduled command a single "trace", and
+     * anything calling Artisan::call() repeatedly did the same. The sequence
+     * counter grew without bound and `wiretap trace <id>` returned the whole
+     * process.
+     *
+     * The flush matters as much as the id. A short command never reaches the
+     * terminating callback in time to be useful, and a daemon — horizon,
+     * schedule:work — never reaches it at all, so records sat in the buffer
+     * until the 200-record threshold or process exit, and PHP runs no shutdown
+     * functions on the SIGTERM that supervisor and Kubernetes send.
+     */
+    private function registerConsoleCorrelation(): void
+    {
+        if (!$this->app->bound('events')) {
+            return;
+        }
+
+        $events = $this->app->make('events');
+
+        $events->listen(CommandStarting::class, static function (CommandStarting $event): void {
+            Correlation::reset();
+            Correlation::start();
+        });
+
+        $events->listen(CommandFinished::class, static function (CommandFinished $event): void {
+            Wiretap::recorder()->flush();
+            Correlation::reset();
+        });
+    }
+
     private function registerCorrelationMiddleware(): void
     {
         if (!$this->app->bound(Kernel::class)) {
@@ -207,6 +345,30 @@ final class WiretapServiceProvider extends ServiceProvider
         }
     }
 
+    /**
+     * Whether this Http factory already carries our middleware.
+     *
+     * Http::globalMiddleware() appends unconditionally, so booting the
+     * provider twice — a host test registering it with force, Octane
+     * rebooting an application in-process — pushed a second copy, and every
+     * outbound call then produced two records, two body captures in memory,
+     * and a sequence counting 0 and 1 for the same call.
+     *
+     * Asked of the factory rather than tracked in a static flag: each
+     * application gets a fresh factory, and a process-wide flag meant the
+     * second application in a test run installed nothing at all.
+     */
+    private static function alreadyInstalled(HttpFactory $factory): bool
+    {
+        foreach ($factory->getGlobalMiddleware() as $middleware) {
+            if ($middleware instanceof WiretapMiddleware) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private function attachCaptureSurfaces(): void
     {
         /** @var array<string, mixed> $capture */
@@ -218,7 +380,11 @@ final class WiretapServiceProvider extends ServiceProvider
         // including the one Http::fake() installs, which would silently break
         // every Http::fake() in the host application's test suite. Installing
         // an observability package must not change how anyone's tests behave.
-        if (($capture['http_client'] ?? true) && class_exists(Http::class)) {
+        $factory = class_exists(Http::class) ? Http::getFacadeRoot() : null;
+
+        if (($capture['http_client'] ?? true)
+            && $factory instanceof HttpFactory
+            && !self::alreadyInstalled($factory)) {
             // Resolved per call, not captured here: middleware is pushed once
             // at boot, and a host application's test calling Wiretap::fake()
             // afterwards must be able to redirect this traffic.
@@ -252,10 +418,24 @@ final class WiretapServiceProvider extends ServiceProvider
                     $resolver = static fn (): Recorder => Wiretap::recorder();
 
                     // Attach to a handler the caller supplied rather than
-                    // replacing it.
-                    $config['handler'] = isset($config['handler']) && $config['handler'] instanceof HandlerStack
-                        ? Stack::attach($config['handler'], $resolver)
-                        : Stack::wrap($resolver);
+                    // replacing it — whatever shape it is in.
+                    //
+                    // Only a HandlerStack used to survive. Guzzle accepts any
+                    // callable as a handler, so app(Client::class, ['config'
+                    // => ['handler' => new MockHandler([...])]]) had its mock
+                    // silently swapped for the default transport: a test that
+                    // believed it was stubbing traffic made real network
+                    // requests instead, and it happened even with capture
+                    // disabled.
+                    $handler = $config['handler'] ?? null;
+
+                    if ($handler instanceof HandlerStack) {
+                        $config['handler'] = Stack::attach($handler, $resolver);
+                    } elseif (is_callable($handler)) {
+                        $config['handler'] = Stack::attach(HandlerStack::create($handler), $resolver);
+                    } else {
+                        $config['handler'] = Stack::wrap($resolver);
+                    }
 
                     return new GuzzleClient($config);
                 },

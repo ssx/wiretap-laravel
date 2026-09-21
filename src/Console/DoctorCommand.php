@@ -6,6 +6,7 @@ namespace Ssx\Wiretap\Laravel\Console;
 
 use Illuminate\Console\Command;
 use Ssx\Wiretap\Guzzle\Stack;
+use Ssx\Wiretap\Laravel\WiretapServiceProvider;
 use Ssx\Wiretap\Recorder;
 
 final class DoctorCommand extends Command
@@ -21,7 +22,14 @@ final class DoctorCommand extends Command
         $this->line('');
         $this->line('<options=bold>Laravel integration</>');
 
-        $enabled = (bool) config('wiretap.enabled');
+        // The same interpretation the provider uses, not a plain cast.
+        //
+        // env() leaves "off" and "no" as strings, and (bool) 'off' is true —
+        // so doctor reported capture as enabled while the provider had
+        // correctly disabled it. The one command someone runs *because* they
+        // are unsure whether capture is on was answering the opposite of the
+        // truth.
+        $enabled = WiretapServiceProvider::truthy(config('wiretap.enabled'));
         $this->row('capture enabled', $enabled ? 'yes' : 'no — set WIRETAP_ENABLED=true', $enabled);
         $this->row('recorder enabled', $recorder->isEnabled() ? 'yes' : 'no', $recorder->isEnabled());
 
