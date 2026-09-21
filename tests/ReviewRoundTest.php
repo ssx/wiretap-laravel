@@ -279,3 +279,99 @@ describe('artisan argument forwarding', function (): void {
             ->expectsOutputToContain('plain');
     });
 });
+
+describe('sampling key', function (): void {
+    it('keys the decision with the application key by default', function (): void {
+        // Sampling is deterministic on the correlation id, and
+        // StartCorrelation adopts an inbound X-Request-Id — so without a salt
+        // the key is caller-controlled and the decision computable offline.
+        $method = new ReflectionMethod(WiretapServiceProvider::class, 'samplingSalt');
+        $method->setAccessible(true);
+
+        expect($method->invoke(null, (array) config('wiretap')))->toBe(config('app.key'));
+    });
+
+    it('lets a dedicated salt override it', function (): void {
+        $config = (array) config('wiretap');
+        $config['sampling_salt'] = 'explicit-secret';
+
+        $method = new ReflectionMethod(WiretapServiceProvider::class, 'samplingSalt');
+        $method->setAccessible(true);
+
+        expect($method->invoke(null, $config))->toBe('explicit-secret');
+    });
+
+    it('is null when the application has no key', function (): void {
+        config(['app.key' => '']);
+
+        $method = new ReflectionMethod(WiretapServiceProvider::class, 'samplingSalt');
+        $method->setAccessible(true);
+
+        expect($method->invoke(null, (array) config('wiretap')))->toBeNull();
+    });
+
+    it('makes an offline-computed correlation id useless', function (): void {
+        // End to end, stated as the property rather than as one outcome.
+        //
+        // A single id is not a test: at a 1% rate the salted key lands in the
+        // sampled-in bucket 1% of the time by chance, so asserting one id is
+        // dropped passes 99 runs in 100 and fails the hundredth. CI found that
+        // on a random app key before this was rewritten.
+        //
+        // What actually matters is that computing an id offline buys nothing:
+        // of many ids chosen to be sampled IN under the unsalted algorithm,
+        // the salted sampler keeps only about the base rate of them.
+        $rate = 100; // 1%
+        $salt = 'fixed-for-determinism';
+
+        $unsalted = new Ssx\Wiretap\Sampler(rateBasisPoints: $rate, alwaysKeepFailures: false);
+        $salted = new Ssx\Wiretap\Sampler(
+            rateBasisPoints: $rate,
+            alwaysKeepFailures: false,
+            samplingSalt: $salt,
+        );
+
+        $chosen = [];
+
+        for ($i = 0; count($chosen) < 200 && $i < 1_000_000; ++$i) {
+            if ((crc32("chosen-{$i}") % 10000) < $rate) {
+                $chosen[] = "chosen-{$i}";
+            }
+        }
+
+        expect($chosen)->toHaveCount(200);
+
+        $unsaltedKept = 0;
+        $saltedKept = 0;
+
+        foreach ($chosen as $id) {
+            $exchange = new Ssx\Wiretap\Exchange(
+                id: 'x',
+                correlationId: $id,
+                transport: 'guzzle',
+                method: 'GET',
+                uri: 'https://api.example.com/v1',
+                requestHeaders: Ssx\Wiretap\Headers::empty(),
+                requestBody: Ssx\Wiretap\CapturedBody::none(),
+                status: 200,
+                reason: 'OK',
+                responseHeaders: Ssx\Wiretap\Headers::empty(),
+                responseBody: Ssx\Wiretap\CapturedBody::none(),
+                timings: new Ssx\Wiretap\Timings(total: 1),
+                error: null,
+                startedAt: 1.0,
+            );
+
+            $unsaltedKept += $unsalted->shouldKeep($exchange) ? 1 : 0;
+            $saltedKept += $salted->shouldKeep($exchange) ? 1 : 0;
+        }
+
+        // Every one of them, by construction — the attacker's computation is
+        // exactly right when there is no salt.
+        expect($unsaltedKept)->toBe(200)
+            // And worth no more than chance once there is one. ~2 expected at
+            // 1%; 40 is a generous ceiling that still fails loudly if the salt
+            // were ignored.
+            ->and($saltedKept)->toBeLessThan(40);
+    });
+});

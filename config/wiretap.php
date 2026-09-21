@@ -151,6 +151,18 @@ return [
     */
 
     'sample_rate_basis_points' => env('WIRETAP_SAMPLE_BP', 10000),
+
+    /*
+    | The decision is keyed with a per-install secret, defaulting to app.key.
+    |
+    | Without one it is a pure function of the correlation id — which is
+    | adopted from an inbound traceparent or X-Request-Id so traces join up
+    | with the caller. That would let a caller compute an id offline that keeps
+    | their own traffic out of the capture. Set this only if you would rather
+    | not derive anything else from app.key.
+    */
+    'sampling_salt' => env('WIRETAP_SAMPLE_SALT'),
+
     'always_keep_failures' => true,
     'slow_threshold_us' => env('WIRETAP_SLOW_US', 2_000_000),
 
