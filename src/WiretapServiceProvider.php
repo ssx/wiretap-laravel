@@ -30,6 +30,7 @@ use Ssx\Wiretap\Laravel\Console\PruneCommand;
 use Ssx\Wiretap\Laravel\Console\ShowCommand;
 use Ssx\Wiretap\Laravel\Console\TraceCommand;
 use Ssx\Wiretap\Laravel\Http\StartCorrelation;
+use Ssx\Wiretap\Laravel\Internal\RunningContext;
 use Ssx\Wiretap\Laravel\Queue\StartJobCorrelation;
 use Ssx\Wiretap\Reader\NdjsonReader;
 use Ssx\Wiretap\Recorder;
@@ -42,6 +43,12 @@ use Ssx\Wiretap\Wiretap;
 
 final class WiretapServiceProvider extends ServiceProvider
 {
+    /**
+     * Shells report a signal death as 128 + signal number; matching that keeps
+     * `echo $?` saying what it would have said without wiretap installed.
+     */
+    private const EXIT_SIGNAL_BASE = 128;
+
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/wiretap.php', 'wiretap');
@@ -91,6 +98,7 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->registerCorrelationMiddleware();
         $this->registerQueueCorrelation();
         $this->registerConsoleCorrelation();
+        $this->registerSignalFlush();
 
         // Octane runs terminating callbacks per request, and a queue worker
         // per job. Without this the recorder flushed only at 200 records, 8
@@ -355,8 +363,14 @@ final class WiretapServiceProvider extends ServiceProvider
         $events = $this->app->make('events');
         $listener = $this->app->make(StartJobCorrelation::class);
 
+        $events->listen(JobProcessing::class, static function (JobProcessing $event): void {
+            // The job class, so a worker's records say what actually made the
+            // call instead of all reporting "queue:work".
+            RunningContext::job($event->job->resolveName(), set: true);
+        });
         $events->listen(JobProcessing::class, [$listener, 'processing']);
         $events->listen(JobProcessed::class, [$listener, 'processed']);
+        $events->listen(JobProcessed::class, static fn (): ?string => RunningContext::job(null, set: true));
         $events->listen(JobFailed::class, [$listener, 'failed']);
         // A retryable failure emits only this one.
         $events->listen(JobExceptionOccurred::class, [$listener, 'exceptionOccurred']);
@@ -389,12 +403,71 @@ final class WiretapServiceProvider extends ServiceProvider
         $events->listen(CommandStarting::class, static function (CommandStarting $event): void {
             Correlation::reset();
             Correlation::start();
+            // So the record names this command rather than argv[1], which in
+            // a worker is "queue:work" for every job it ever handles.
+            RunningContext::command($event->command, set: true);
         });
 
         $events->listen(CommandFinished::class, static function (CommandFinished $event): void {
             Wiretap::recorder()->flush();
             Correlation::reset();
+            RunningContext::command(null, set: true);
         });
+    }
+
+    /**
+     * Flush on the signal a process manager sends to stop a daemon.
+     *
+     * PHP runs no shutdown functions on SIGTERM — verified, not assumed — and
+     * SIGTERM is what supervisor, systemd and Kubernetes send. A long-running
+     * console process that is not a queue worker (reverb:start, a custom
+     * `while (true)` command) reaches neither CommandFinished nor the
+     * terminating callback, so whatever it had buffered was discarded on every
+     * restart and deploy: up to 200 records, up to 8 MiB.
+     *
+     * A queue worker is already covered — it flushes as each owned job
+     * finishes — and short commands are covered by CommandFinished. This is
+     * for what is left.
+     *
+     * Any handler already installed is called afterwards, so this adds a flush
+     * rather than taking over the signal. A component that installs its own
+     * handler *later* replaces this one; Laravel's queue worker does exactly
+     * that, and that is fine, because the worker flushes per job anyway.
+     */
+    private function registerSignalFlush(): void
+    {
+        if (!$this->app->runningInConsole()
+            || !function_exists('pcntl_signal')
+            || !function_exists('pcntl_async_signals')) {
+            return;
+        }
+
+        pcntl_async_signals(true);
+
+        foreach ([SIGTERM, SIGINT] as $signal) {
+            $previous = pcntl_signal_get_handler($signal);
+
+            pcntl_signal($signal, static function (int $received) use ($previous): void {
+                try {
+                    Wiretap::recorder()->flush();
+                } catch (\Throwable) {
+                    // Never let instrumentation change how a process dies.
+                }
+
+                if (is_callable($previous)) {
+                    $previous($received);
+
+                    return;
+                }
+
+                // SIG_DFL for these two means terminate, and nothing else has
+                // asked to handle it — so do what the default would have done
+                // rather than swallowing the signal and hanging the process.
+                if ($previous === SIG_DFL) {
+                    exit(self::EXIT_SIGNAL_BASE + $received);
+                }
+            });
+        }
     }
 
     private function registerCorrelationMiddleware(): void

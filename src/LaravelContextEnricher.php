@@ -7,6 +7,7 @@ namespace Ssx\Wiretap\Laravel;
 use Illuminate\Container\Container;
 use Ssx\Wiretap\Contract\ContextEnricher;
 use Ssx\Wiretap\Laravel\Http\StartCorrelation;
+use Ssx\Wiretap\Laravel\Internal\RunningContext;
 use Ssx\Wiretap\Exchange;
 
 /**
@@ -170,7 +171,9 @@ final readonly class LaravelContextEnricher implements ContextEnricher
         $argv = $_SERVER['argv'] ?? [];
 
         return array_filter([
-            'command' => is_array($argv) && count($argv) > 1 ? (string) $argv[1] : null,
+            // What the listeners observed, falling back to argv.
+            'command' => RunningContext::command() ?? (is_array($argv) && count($argv) > 1 ? (string) $argv[1] : null),
+            'job' => RunningContext::job(),
             'env' => (string) $this->container()->make('app')->environment(),
         ], static fn (mixed $v): bool => $v !== null && $v !== '');
     }
