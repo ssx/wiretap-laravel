@@ -194,11 +194,7 @@ final class WiretapServiceProvider extends ServiceProvider
                 ? new NdjsonFileSink(self::path($config))
                 : new NullSink(),
             blocklist: $this->buildBlocklist($config),
-            redactor: new Redactor(new RedactionConfig(
-                enabled: self::truthy($redaction['enabled'] ?? true),
-                bodyPaths: array_values((array) ($redaction['body_paths'] ?? [])),
-                maxBodyBytes: (int) ($redaction['max_body_bytes'] ?? 65536),
-            )),
+            redactor: new Redactor($this->redactionConfig($redaction)),
             sampler: new Sampler(
                 rateBasisPoints: (int) ($config['sample_rate_basis_points'] ?? 10000),
                 alwaysKeepFailures: (bool) ($config['always_keep_failures'] ?? true),
@@ -210,6 +206,77 @@ final class WiretapServiceProvider extends ServiceProvider
         );
 
         return $recorder->addEnricher(new LaravelContextEnricher());
+    }
+
+    /**
+     * The redaction rules, with every option the core config exposes.
+     *
+     * Only enabled, body_paths and max_body_bytes used to be passed through,
+     * so ten of core's options had no config key at all. An application whose
+     * partner API authenticates with `X-Partner-Secret` could not add that
+     * header to the denylist — it was captured in full and nothing in Laravel
+     * could stop it — and `patterns.email` could not be turned on, which
+     * matters because a string user identifier can be an email address.
+     *
+     * Lists merge with core's defaults rather than replacing them. Replacing
+     * would mean naming one extra sensitive header silently dropped
+     * Authorization, Cookie and the rest, which is the opposite of what
+     * someone adding a header to a denylist is asking for. `patterns` is
+     * merged by key so a single detector can be flipped without restating
+     * the others.
+     *
+     * @param array<string, mixed> $redaction
+     */
+    private function redactionConfig(array $redaction): RedactionConfig
+    {
+        /** @var array<string, mixed> $patterns */
+        $patterns = (array) ($redaction['patterns'] ?? []);
+
+        $defaults = new RedactionConfig();
+
+        return new RedactionConfig(
+            enabled: self::truthy($redaction['enabled'] ?? true),
+            headerMode: is_string($redaction['header_mode'] ?? null)
+                ? $redaction['header_mode']
+                : $defaults->headerMode,
+            // Core's own lists are lowercase and it matches case-insensitively,
+            // so configured names are lowered before merging — otherwise
+            // 'Authorization' and 'authorization' both end up in the list.
+            headers: self::mergeList($defaults->headers, $redaction['headers'] ?? [], lower: true),
+            query: self::mergeList($defaults->query, $redaction['query'] ?? [], lower: true),
+            bodyPaths: array_values((array) ($redaction['body_paths'] ?? [])),
+            patterns: array_merge($defaults->patterns, array_filter(
+                $patterns,
+                static fn (mixed $v): bool => is_bool($v),
+            )),
+            custom: self::mergeList([], $redaction['custom'] ?? []),
+            safetyNet: self::truthy($redaction['safety_net'] ?? true),
+            capturableTypes: self::mergeList($defaults->capturableTypes, $redaction['capturable_types'] ?? []),
+            maxBodyBytes: (int) ($redaction['max_body_bytes'] ?? $defaults->maxBodyBytes),
+            maxHeaderValueBytes: (int) ($redaction['max_header_value_bytes'] ?? $defaults->maxHeaderValueBytes),
+            minEchoedSecretLength: (int) ($redaction['min_echoed_secret_length'] ?? $defaults->minEchoedSecretLength),
+            omitUninspectableBodies: self::truthy($redaction['omit_uninspectable_bodies'] ?? true),
+        );
+    }
+
+    /**
+     * Configured strings added to core's defaults, de-duplicated.
+     *
+     * @param  list<string> $defaults
+     * @return list<string>
+     */
+    private static function mergeList(array $defaults, mixed $configured, bool $lower = false): array
+    {
+        $extra = array_values(array_filter(
+            (array) $configured,
+            static fn (mixed $v): bool => is_string($v) && trim($v) !== '',
+        ));
+
+        if ($lower) {
+            $extra = array_map(static fn (string $v): string => strtolower(trim($v)), $extra);
+        }
+
+        return array_values(array_unique(array_merge($defaults, $extra)));
     }
 
     /**
