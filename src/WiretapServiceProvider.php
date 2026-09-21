@@ -163,6 +163,41 @@ final class WiretapServiceProvider extends ServiceProvider
     }
 
     /**
+     * The secret the sampling decision is keyed with.
+     *
+     * Sampling is deterministic on the correlation id, and StartCorrelation
+     * adopts an inbound traceparent or X-Request-Id so a trace joins up with
+     * whatever called us. That makes the sampling key caller-controlled: below
+     * 100% a caller who knows the algorithm can compute an id that keeps their
+     * own traffic out of the capture, or collide with another request's id.
+     *
+     * Keying the decision with the application key fixes that without giving
+     * anything up — the id is still recorded exactly as it arrived, so traces
+     * still join; only the key the decision is computed from changes. The
+     * application key is already a per-install secret that must not leak, so
+     * it needs no new configuration and nothing extra to rotate.
+     *
+     * A dedicated `sampling_salt` overrides it for anyone who would rather not
+     * derive anything else from `app.key`. Null when neither is set, which is
+     * core's previous behaviour and fine at 100% sampling or where nothing
+     * untrusted reaches the correlation id.
+     *
+     * @param array<string, mixed> $config
+     */
+    private static function samplingSalt(array $config): ?string
+    {
+        $configured = $config['sampling_salt'] ?? null;
+
+        if (is_string($configured) && trim($configured) !== '') {
+            return $configured;
+        }
+
+        $key = config('app.key');
+
+        return is_string($key) && trim($key) !== '' ? $key : null;
+    }
+
+    /**
      * The configured log directory, never an empty string.
      *
      * A missing or blank path used to become "" through a (string) cast, and
@@ -209,6 +244,7 @@ final class WiretapServiceProvider extends ServiceProvider
                 slowThresholdUs: ($config['slow_threshold_us'] ?? null) === null
                     ? null
                     : (int) $config['slow_threshold_us'],
+                samplingSalt: self::samplingSalt($config),
             ),
             enabled: $enabled,
         );

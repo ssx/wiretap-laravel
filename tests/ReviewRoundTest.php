@@ -279,3 +279,76 @@ describe('artisan argument forwarding', function (): void {
             ->expectsOutputToContain('plain');
     });
 });
+
+describe('sampling key', function (): void {
+    it('keys the decision with the application key by default', function (): void {
+        // Sampling is deterministic on the correlation id, and
+        // StartCorrelation adopts an inbound X-Request-Id — so without a salt
+        // the key is caller-controlled and the decision computable offline.
+        $method = new ReflectionMethod(WiretapServiceProvider::class, 'samplingSalt');
+        $method->setAccessible(true);
+
+        expect($method->invoke(null, (array) config('wiretap')))->toBe(config('app.key'));
+    });
+
+    it('lets a dedicated salt override it', function (): void {
+        $config = (array) config('wiretap');
+        $config['sampling_salt'] = 'explicit-secret';
+
+        $method = new ReflectionMethod(WiretapServiceProvider::class, 'samplingSalt');
+        $method->setAccessible(true);
+
+        expect($method->invoke(null, $config))->toBe('explicit-secret');
+    });
+
+    it('is null when the application has no key', function (): void {
+        config(['app.key' => '']);
+
+        $method = new ReflectionMethod(WiretapServiceProvider::class, 'samplingSalt');
+        $method->setAccessible(true);
+
+        expect($method->invoke(null, (array) config('wiretap')))->toBeNull();
+    });
+
+    it('makes an offline-computed correlation id useless', function (): void {
+        // End to end: an id computed to be sampled in under the unsalted
+        // algorithm does not get that outcome once the app key is the key.
+        $rate = 100;
+        $chosen = null;
+
+        for ($i = 0; $i < 100_000; ++$i) {
+            if ((crc32("chosen-{$i}") % 10000) < $rate) {
+                $chosen = "chosen-{$i}";
+
+                break;
+            }
+        }
+
+        $exchange = new Ssx\Wiretap\Exchange(
+            id: 'x',
+            correlationId: (string) $chosen,
+            transport: 'guzzle',
+            method: 'GET',
+            uri: 'https://api.example.com/v1',
+            requestHeaders: Ssx\Wiretap\Headers::empty(),
+            requestBody: Ssx\Wiretap\CapturedBody::none(),
+            status: 200,
+            reason: 'OK',
+            responseHeaders: Ssx\Wiretap\Headers::empty(),
+            responseBody: Ssx\Wiretap\CapturedBody::none(),
+            timings: new Ssx\Wiretap\Timings(total: 1),
+            error: null,
+            startedAt: 1.0,
+        );
+
+        $unsalted = new Ssx\Wiretap\Sampler(rateBasisPoints: $rate, alwaysKeepFailures: false);
+        $salted = new Ssx\Wiretap\Sampler(
+            rateBasisPoints: $rate,
+            alwaysKeepFailures: false,
+            samplingSalt: (string) config('app.key'),
+        );
+
+        expect($unsalted->shouldKeep($exchange))->toBeTrue()
+            ->and($salted->shouldKeep($exchange))->toBeFalse();
+    });
+});
