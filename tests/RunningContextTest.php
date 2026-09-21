@@ -12,123 +12,21 @@ use Symfony\Component\Console\Output\NullOutput;
 
 afterEach(fn () => RunningContext::reset());
 
+/**
+ * A queue job double.
+ *
+ * Mocked rather than hand-implemented: the interface gains methods between
+ * Laravel majors — 12 added resolveQueuedJobClass() — and an anonymous class
+ * implementing it passes on one major and is a fatal error on the next.
+ */
 function fakeQueueJob(string $name): Illuminate\Contracts\Queue\Job
 {
-    return new class($name) implements Illuminate\Contracts\Queue\Job {
-        public function __construct(private string $name)
-        {
-        }
+    $job = Mockery::mock(Illuminate\Contracts\Queue\Job::class);
+    $job->shouldReceive('resolveName')->andReturn($name);
+    $job->shouldReceive('uuid')->andReturn('job-uuid');
+    $job->shouldIgnoreMissing();
 
-        public function resolveName(): string
-        {
-            return $this->name;
-        }
-
-        public function uuid(): ?string
-        {
-            return 'job-uuid';
-        }
-
-        public function getJobId(): ?string
-        {
-            return '1';
-        }
-
-        public function payload(): array
-        {
-            return [];
-        }
-
-        public function fire(): void
-        {
-        }
-
-        public function release($delay = 0): void
-        {
-        }
-
-        public function isReleased(): bool
-        {
-            return false;
-        }
-
-        public function delete(): void
-        {
-        }
-
-        public function isDeleted(): bool
-        {
-            return false;
-        }
-
-        public function isDeletedOrReleased(): bool
-        {
-            return false;
-        }
-
-        public function attempts(): int
-        {
-            return 1;
-        }
-
-        public function hasFailed(): bool
-        {
-            return false;
-        }
-
-        public function markAsFailed(): void
-        {
-        }
-
-        public function fail($e = null): void
-        {
-        }
-
-        public function maxTries(): ?int
-        {
-            return null;
-        }
-
-        public function maxExceptions(): ?int
-        {
-            return null;
-        }
-
-        public function backoff(): ?int
-        {
-            return null;
-        }
-
-        public function retryUntil(): ?int
-        {
-            return null;
-        }
-
-        public function timeout(): ?int
-        {
-            return null;
-        }
-
-        public function getName(): string
-        {
-            return $this->name;
-        }
-
-        public function getConnectionName(): string
-        {
-            return 'sync';
-        }
-
-        public function getQueue(): string
-        {
-            return 'default';
-        }
-
-        public function getRawBody(): string
-        {
-            return '';
-        }
-    };
+    return $job;
 }
 
 it('names the running artisan command rather than argv', function (): void {
