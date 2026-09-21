@@ -23,9 +23,10 @@ final class TraceCommand extends Command
 
     public function handle(): int
     {
-        return $this->runCore('trace', array_merge(
-            [self::asString($this->argument('correlation'))],
+        return $this->runCore(
+            'trace',
             $this->forwardOptions(['limit']),
-        ));
+            [self::asString($this->argument('correlation'))],
+        );
     }
 }

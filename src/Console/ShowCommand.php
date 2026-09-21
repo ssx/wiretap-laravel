@@ -26,9 +26,10 @@ final class ShowCommand extends Command
 
     public function handle(): int
     {
-        return $this->runCore('show', array_merge(
-            [self::asString($this->argument('exchange'))],
+        return $this->runCore(
+            'show',
             $this->forwardOptions(['curl', 'har', 'json', 'raw']),
-        ));
+            [self::asString($this->argument('exchange'))],
+        );
     }
 }
