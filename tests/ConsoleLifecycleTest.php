@@ -64,6 +64,48 @@ function runConsoleFixture(string $command, bool $enabled = true): array
     ];
 }
 
+/**
+ * Two jobs through a real worker command, with Symfony's console events
+ * rerouted as a real artisan process does.
+ *
+ * @return array<string, string> correlation id seen by each job
+ */
+function runRealWorker(Illuminate\Contracts\Foundation\Application $app, string $command): array
+{
+    $kernel = $app->make(ConsoleKernel::class);
+    $kernel->rerouteSymfonyCommandEvents();
+    $kernel->setArtisan(null);
+
+    config(['queue.default' => 'database']);
+    Schema::create('jobs', function ($table): void {
+        $table->id();
+        $table->string('queue')->index();
+        $table->longText('payload');
+        $table->unsignedTinyInteger('attempts');
+        $table->unsignedInteger('reserved_at')->nullable();
+        $table->unsignedInteger('available_at');
+        $table->unsignedInteger('created_at');
+    });
+
+    Http::fake(fn () => Http::response('{}', 200, ['Content-Type' => 'application/json']));
+    LifecycleQueuedJob::$ids = [];
+    LifecycleQueuedJob::$after = [];
+    LifecycleQueuedJob::$onDiskBeforeSecond = null;
+    LifecycleQueuedJob::dispatch('a');
+    LifecycleQueuedJob::dispatch('b');
+
+    $path = (string) config('wiretap.path');
+    Event::listen(JobProcessing::class, function () use ($path): void {
+        if (count(LifecycleQueuedJob::$ids) === 1) {
+            LifecycleQueuedJob::$onDiskBeforeSecond = (glob($path . '/*.ndjson') ?: []) !== [];
+        }
+    });
+
+    Artisan::call($command, ['connection' => 'database', '--stop-when-empty' => true, '--sleep' => 0]);
+
+    return LifecycleQueuedJob::$ids;
+}
+
 final class LifecycleQueuedJob implements ShouldQueue
 {
     use Dispatchable;
@@ -71,6 +113,13 @@ final class LifecycleQueuedJob implements ShouldQueue
 
     /** @var array<string, string> */
     public static array $ids = [];
+
+    /** @var array<string, string> */
+    public static array $after = [];
+
+    public static bool $callsCommand = false;
+
+    public static ?bool $onDiskBeforeSecond = null;
 
     public function __construct(public string $name)
     {
@@ -80,6 +129,11 @@ final class LifecycleQueuedJob implements ShouldQueue
     {
         Http::get('https://api.example.test/job/' . $this->name);
         self::$ids[$this->name] = Correlation::id();
+
+        if (self::$callsCommand) {
+            Artisan::call('wiretap:doctor');
+            self::$after[$this->name] = Correlation::id();
+        }
     }
 }
 
@@ -116,14 +170,12 @@ describe('signals', function (): void {
             ->and($run['exit'])->toBe(0);
     });
 
-    it('still flushes a command killed by SIGTERM, and still dies by that signal', function (): void {
-        // Without wiretap the default disposition kills the process by the
-        // signal; a flush must not turn that into an ordinary exit code.
+    it('lets a command killed by SIGTERM die by that signal', function (): void {
+        // The old handler turned a signal death into exit(143).
         $run = runConsoleFixture('fixture:plain');
 
         expect($run['output'])->not->toContain('survived')
-            ->and($run['signal'])->toBe(SIGTERM)
-            ->and($run['records'])->toHaveCount(1);
+            ->and($run['signal'])->toBe(SIGTERM);
     });
 
     it('does not change a killed process when capture is off', function (): void {
@@ -145,61 +197,90 @@ describe('signals', function (): void {
             ->and(pcntl_signal_get_handler(SIGTERM))->toBe(SIG_DFL);
     });
 
-    it('installs nothing when capture is off', function (): void {
+    it('installs no signal handler at all', function (bool $enabled): void {
+        // Any handler changes how some application shuts down: one that
+        // switches to deferred dispatch, or chains to the previous handler,
+        // had SIGTERM swallowed. So there is none, capture on or off.
         pcntl_async_signals(true);
 
-        $this->bootWith(['wiretap.enabled' => false]);
+        $this->bootWith(['wiretap.enabled' => $enabled]);
         $this->app->make('events')->dispatch(new CommandStarting('anything', new ArrayInput([]), new NullOutput()));
 
         expect(pcntl_signal_get_handler(SIGTERM))->toBe(SIG_DFL)
             ->and(pcntl_signal_get_handler(SIGINT))->toBe(SIG_DFL);
-    });
+    })->with([[true], [false]]);
 });
 
 describe('queue workers', function (): void {
+    afterEach(function (): void {
+        LifecycleQueuedJob::$callsCommand = false;
+    });
+
     it('gives each job under a real queue:work its own correlation and flush', function (): void {
         // The console listener started an explicit correlation for queue:work
         // itself, so every job declined ownership: one id for the whole
         // worker, and nothing written until the worker exited. Only visible
         // with Symfony's console events rerouted, as a real artisan does.
+        $ids = runRealWorker($this->app, 'queue:work');
+
+        expect($ids)->toHaveCount(2)
+            ->and($ids['a'])->not->toBe($ids['b'])
+            ->and(LifecycleQueuedJob::$onDiskBeforeSecond)->toBeTrue();
+    });
+
+    it('treats any WorkCommand as a worker, whatever it is called', function (): void {
+        // rabbitmq:consume and an application's own subclasses are workers
+        // too; matching by name alone gave them one id for every job.
+        Illuminate\Console\Application::starting(function (Illuminate\Console\Application $artisan): void {
+            $artisan->add(new class extends Illuminate\Queue\Console\WorkCommand {
+                public function __construct()
+                {
+                    $this->signature = str_replace('queue:work', 'custom:consume', $this->signature);
+                    parent::__construct(app('queue.worker'), app('cache.store'));
+                }
+            });
+        });
+
+        $ids = runRealWorker($this->app, 'custom:consume');
+
+        expect($ids['a'])->not->toBe($ids['b']);
+    });
+
+    it('keeps a job\'s correlation through a command it calls', function (): void {
+        // CommandStarting reset the correlation and CommandFinished reset it
+        // again, so a job calling Artisan::call() had its trace cut in two.
+        LifecycleQueuedJob::$callsCommand = true;
+
+        $ids = runRealWorker($this->app, 'queue:work');
+
+        expect(LifecycleQueuedJob::$after['a'])->toBe($ids['a'])
+            ->and(LifecycleQueuedJob::$after['b'])->toBe($ids['b']);
+    });
+});
+
+describe('commands called from a request', function (): void {
+    it('neither reset the correlation nor flush mid-request', function (): void {
         $kernel = $this->app->make(ConsoleKernel::class);
         $kernel->rerouteSymfonyCommandEvents();
         $kernel->setArtisan(null);
 
-        config(['queue.default' => 'database']);
-        Schema::create('jobs', function ($table): void {
-            $table->id();
-            $table->string('queue')->index();
-            $table->longText('payload');
-            $table->unsignedTinyInteger('attempts');
-            $table->unsignedInteger('reserved_at')->nullable();
-            $table->unsignedInteger('available_at');
-            $table->unsignedInteger('created_at');
-        });
-
         Http::fake(fn () => Http::response('{}', 200, ['Content-Type' => 'application/json']));
-        LifecycleQueuedJob::$ids = [];
-        LifecycleQueuedJob::dispatch('a');
-        LifecycleQueuedJob::dispatch('b');
-
-        $started = false;
-        Event::listen(\Illuminate\Console\Events\CommandStarting::class, function () use (&$started): void {
-            $started = true;
-        });
-
-        $onDiskBeforeSecond = null;
         $path = $this->logPath;
-        Event::listen(JobProcessing::class, function () use (&$onDiskBeforeSecond, $path): void {
-            if (count(LifecycleQueuedJob::$ids) === 1) {
-                $onDiskBeforeSecond = (glob($path . '/*.ndjson') ?: []) !== [];
-            }
+        $seen = [];
+
+        Illuminate\Support\Facades\Route::get('/calls-a-command', function () use ($path, &$seen) {
+            Http::get('https://api.example.test/before');
+            $seen['before'] = Correlation::id();
+            Artisan::call('wiretap:doctor');
+            $seen['after'] = Correlation::id();
+            $seen['on_disk'] = (glob($path . '/*.ndjson') ?: []) !== [];
+
+            return 'ok';
         });
 
-        Artisan::call('queue:work', ['connection' => 'database', '--stop-when-empty' => true, '--sleep' => 0]);
+        $this->get('/calls-a-command')->assertOk();
 
-        expect($started)->toBeTrue()
-            ->and(LifecycleQueuedJob::$ids)->toHaveCount(2)
-            ->and(LifecycleQueuedJob::$ids['a'])->not->toBe(LifecycleQueuedJob::$ids['b'])
-            ->and($onDiskBeforeSecond)->toBeTrue();
+        expect($seen['after'])->toBe($seen['before'])
+            ->and($seen['on_disk'])->toBeFalse();
     });
 });
