@@ -74,6 +74,13 @@ final class WiretapServiceProvider extends ServiceProvider
      */
     private static array $warned = [];
 
+    /**
+     * HTTP kernels that already end each request's scope for us.
+     *
+     * @var \WeakMap<object, true>|null
+     */
+    private static ?\WeakMap $lifecycleHandlers = null;
+
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/wiretap.php', 'wiretap');
@@ -124,31 +131,18 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->registerQueueCorrelation();
         $this->registerConsoleCorrelation();
 
-        // Octane runs terminating callbacks per request, and a queue worker
-        // per job. Without this the recorder flushed only at 200 records, 8
-        // MiB, or process exit — so someone enabling capture to debug a job
+        // Octane runs terminating callbacks per request. Without this the
+        // recorder flushed only at 200 records, 8 MiB, or process exit — so someone enabling capture to debug a job
         // ran wiretap:list, saw nothing, and concluded the tool was broken.
-        $this->app->terminating(static function (): void {
-            Wiretap::recorder()->flush();
+        $this->app->terminating(function (): void {
+            // After a handled HTTP request, the flush and the end of its
+            // correlation scope wait until the kernel has run every
+            // terminating callback, not just the ones registered before ours.
+            if ($this->deferToEndOfRequest()) {
+                return;
+            }
 
-            // Then end the request's correlation scope.
-            //
-            // Correlation::start() marks the id as explicitly owned, which the
-            // queue listener reads as "an enclosing scope owns this". Nothing
-            // cleared it, so in any process that serves a request and then does
-            // other work — Octane, or a job dispatched from a terminating
-            // callback — every job afterwards declined ownership and inherited
-            // that request's id, forever: one id, one ever-growing sequence,
-            // the wrong route on every record, and one sampling decision for
-            // the whole process.
-            //
-            // Here rather than in the middleware's terminate(): the middleware
-            // is prepended, and Kernel::terminateMiddleware() walks the list in
-            // order, so resetting there ran before every other terminable
-            // middleware. An application shipping metrics over HTTP from one of
-            // those would have had each call given a fresh, unrelated id.
-            // app()->terminate() runs after all of them.
-            Correlation::reset();
+            self::endScope();
         });
 
         // Surfaces are attached even when capture is disabled.
@@ -161,6 +155,76 @@ final class WiretapServiceProvider extends ServiceProvider
         // happened. The package's own tests hid that by enabling wiretap in
         // the test environment.
         $this->attachCaptureSurfaces();
+    }
+
+    /**
+     * Flush, then end the current correlation scope.
+     *
+     * Correlation::start() marks the id as explicitly owned, which the queue
+     * listener reads as "an enclosing scope owns this". Nothing cleared it,
+     * so in any process that serves a request and then does other work —
+     * Octane, or a job dispatched afterwards — every job declined ownership
+     * and inherited that request's id, forever: one id, one ever-growing
+     * sequence, and one sampling decision for the whole process.
+     */
+    private static function endScope(): void
+    {
+        Wiretap::recorder()->flush();
+        Correlation::reset();
+    }
+
+    /**
+     * Hand the end of a request's scope to the kernel's last step, if this is
+     * the end of a handled HTTP request.
+     *
+     * Doing it in our terminating callback was too early. Callbacks run in
+     * registration order, and ours is registered by a package provider, so
+     * it ran before the application's own — anything an AppServiceProvider
+     * registers. A metrics call made from one of those got a fresh, unrelated
+     * correlation id, and its record then sat in the buffer until some later
+     * request happened to flush it. The middleware's terminate() is earlier
+     * still.
+     *
+     * Kernel::terminate() runs its request-lifecycle handlers after
+     * app()->terminate() has run every terminating callback, including ones
+     * added while terminating. So the flush goes there, as a handler with a
+     * threshold every request exceeds. It is registered from here, the first
+     * time a request ends, rather than at boot, so that it also comes after
+     * lifecycle handlers the application registers at boot; and only once
+     * per kernel, because handlers are never removed.
+     *
+     * Anything else — a console kernel, a kernel without lifecycle handlers,
+     * an app()->terminate() outside a request — ends the scope here, as
+     * before.
+     */
+    private function deferToEndOfRequest(): bool
+    {
+        try {
+            if (!$this->app->bound(Kernel::class)) {
+                return false;
+            }
+
+            $kernel = $this->app->make(Kernel::class);
+
+            if (!method_exists($kernel, 'requestStartedAt')
+                || !method_exists($kernel, 'whenRequestLifecycleIsLongerThan')
+                || $kernel->requestStartedAt() === null) {
+                return false;
+            }
+
+            $registered = self::$lifecycleHandlers ??= new \WeakMap();
+
+            if (!$registered->offsetExists($kernel)) {
+                $registered->offsetSet($kernel, true);
+                $kernel->whenRequestLifecycleIsLongerThan(-1, static function (): void {
+                    self::endScope();
+                });
+            }
+
+            return true;
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     /**
@@ -216,9 +280,9 @@ final class WiretapServiceProvider extends ServiceProvider
      * adopts an inbound traceparent or X-Request-Id so a trace joins up with
      * whatever called us. That makes the sampling key caller-controlled: below
      * 100% a caller who knows the algorithm can compute an id that keeps their
-     * own traffic out of the capture, or collide with another request's id.
+     * own traffic out of the capture.
      *
-     * Keying the decision with the application key fixes that without giving
+     * Keying the decision with the application key stops that without giving
      * anything up — the id is still recorded exactly as it arrived, so traces
      * still join; only the key the decision is computed from changes. The
      * application key is already a per-install secret that must not leak, so
@@ -228,6 +292,12 @@ final class WiretapServiceProvider extends ServiceProvider
      * derive anything else from `app.key`. Null when neither is set, which is
      * core's previous behaviour and fine at 100% sampling or where nothing
      * untrusted reaches the correlation id.
+     *
+     * What the salt does not do is stop a caller sending another request's
+     * id. The id is adopted as it arrives, so two requests carrying the same
+     * X-Request-Id share a trace and a sampling decision whatever the key.
+     * Only not trusting inbound ids would prevent that, and that would stop
+     * traces joining up with the caller.
      *
      * @param array<string, mixed> $config
      */
@@ -554,14 +624,10 @@ final class WiretapServiceProvider extends ServiceProvider
         $events = $this->app->make('events');
         $listener = $this->app->make(StartJobCorrelation::class);
 
-        $events->listen(JobProcessing::class, static function (JobProcessing $event): void {
-            // The job class, so a worker's records say what actually made the
-            // call instead of all reporting "queue:work".
-            RunningContext::job($event->job->resolveName(), set: true);
-        });
+        // The listener also keeps the running job's name, on the same stack
+        // and the same completion events as its correlation.
         $events->listen(JobProcessing::class, [$listener, 'processing']);
         $events->listen(JobProcessed::class, [$listener, 'processed']);
-        $events->listen(JobProcessed::class, static fn (): ?string => RunningContext::job(null, set: true));
         $events->listen(JobFailed::class, [$listener, 'failed']);
         // A retryable failure emits only this one.
         $events->listen(JobExceptionOccurred::class, [$listener, 'exceptionOccurred']);

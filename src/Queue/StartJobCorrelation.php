@@ -12,6 +12,7 @@ use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Jobs\SyncJob;
 use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Laravel\Http\StartCorrelation;
+use Ssx\Wiretap\Laravel\Internal\RunningContext;
 use Ssx\Wiretap\Wiretap;
 
 /**
@@ -57,6 +58,14 @@ final class StartJobCorrelation
 
         $nested = $this->stack !== [];
         $this->stack[] = $id;
+
+        // The job class, so a worker's records say what actually made the
+        // call instead of all reporting "queue:work". A name that cannot be
+        // read costs the attribution, never the job.
+        try {
+            RunningContext::pushJob($id, $event->job->resolveName());
+        } catch (\Throwable) {
+        }
 
         // An enclosing scope owns the correlation: an outer job, or an HTTP
         // request that dispatched this one synchronously. A sync job inside a
@@ -129,6 +138,8 @@ final class StartJobCorrelation
 
         $owned = $this->owned[$id];
         unset($this->owned[$id]);
+
+        RunningContext::popJob($id);
 
         $position = array_search($id, $this->stack, true);
 

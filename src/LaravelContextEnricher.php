@@ -116,14 +116,28 @@ final readonly class LaravelContextEnricher implements ContextEnricher
     }
 
     /**
-     * A guard the application has already instantiated, or null.
+     * The acting guard, if the application has already instantiated it.
      *
-     * AuthManager exposes no way to ask, so its cache is read directly. Read
-     * only, and a failure here just means no user id on the record.
+     * The acting guard is the manager's default: Auth::shouldUse() and the
+     * `auth:<guard>` middleware both set it. This used to return whichever
+     * guard happened to be first in the cache, so an admin acting through
+     * an `admin` guard, with a customer session also resolved on `web`, was
+     * recorded as the customer. Another guard having a user says nothing
+     * about who is acting now, so when the default guard has not been built
+     * there is no attribution at all.
+     *
+     * AuthManager exposes no way to ask whether a guard has been built, so
+     * its cache is read directly. Read only, and a failure here just means no
+     * user id on the record.
      */
     private static function resolvedGuard(object $manager): ?object
     {
+        if (!method_exists($manager, 'getDefaultDriver')) {
+            return null;
+        }
+
         try {
+            $name = $manager->getDefaultDriver();
             $property = new \ReflectionProperty($manager, 'guards');
             $property->setAccessible(true);
             $guards = $property->getValue($manager);
@@ -131,17 +145,13 @@ final readonly class LaravelContextEnricher implements ContextEnricher
             return null;
         }
 
-        if (!is_array($guards)) {
+        if (!is_string($name) || !is_array($guards)) {
             return null;
         }
 
-        foreach ($guards as $guard) {
-            if (is_object($guard)) {
-                return $guard;
-            }
-        }
+        $guard = $guards[$name] ?? null;
 
-        return null;
+        return is_object($guard) ? $guard : null;
     }
 
     /**

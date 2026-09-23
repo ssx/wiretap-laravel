@@ -32,11 +32,24 @@ final class StartCorrelation
 
     public function handle(Request $request, Closure $next): mixed
     {
-        Correlation::start(
-            $this->firstHeader($request, ['traceparent', 'X-Request-Id', 'X-Correlation-Id'])
-        );
-
         $previous = self::$handling;
+
+        // A request handled inside another one — a package re-entering
+        // Kernel::handle() for multi-tenant routing or an API gateway — is
+        // part of the outer request's work, and joins its correlation.
+        //
+        // Starting a new one here overwrote the outer id and restarted its
+        // sequence at 0, and nothing put either back: the outer request's
+        // remaining calls carried the inner request's id. Joining rather than
+        // saving and restoring keeps the sequence strictly increasing through
+        // the whole trace, so no two records share an (id, sequence) pair; and
+        // core has no way to read or restore a sequence without consuming it.
+        if (!$previous) {
+            Correlation::start(
+                $this->firstHeader($request, ['traceparent', 'X-Request-Id', 'X-Correlation-Id'])
+            );
+        }
+
         self::$handling = true;
 
         try {
