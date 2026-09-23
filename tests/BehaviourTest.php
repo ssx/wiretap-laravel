@@ -5,7 +5,9 @@ declare(strict_types=1);
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Psr7\Response as GuzzleResponse;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Http;
+use Ssx\Wiretap\Laravel\WiretapServiceProvider;
 use Ssx\Wiretap\Recorder;
 
 describe('a caller-supplied callable handler', function (): void {
@@ -22,6 +24,14 @@ describe('a caller-supplied callable handler', function (): void {
 
         expect($plain->get('https://example.test/missing')->getStatusCode())->toBe(404)
             ->and($resolved->get('https://example.test/missing')->getStatusCode())->toBe(404);
+
+        if ($enabled) {
+            // And the record says what the application saw.
+            $record = $this->app->make(Recorder::class)->buffered()[0];
+
+            expect($record->status)->toBe(404)
+                ->and($record->error)->toBeNull();
+        }
     })->with([[true], [false]]);
 
     it('does not follow a redirect the callable would have returned', function (): void {
@@ -47,20 +57,60 @@ describe('a malformed blocklist', function (): void {
         expect($this->app->make(Recorder::class))->toBeInstanceOf(Recorder::class);
     })->with([[true], [false]]);
 
-    it('warns in the application log', function (): void {
-        $this->bootWith(['wiretap.blocklist' => ['ok.test', 42]]);
-
+    it('warns in the application log once per process, and only with capture on', function (): void {
+        // The recorder is built on every request, so a warning per build
+        // flooded any channel that pages someone.
+        $warned = new ReflectionProperty(WiretapServiceProvider::class, 'warned');
         $warnings = [];
-        $log = Mockery::mock();
-        $log->shouldReceive('warning')->andReturnUsing(function (string $message) use (&$warnings): void {
-            $warnings[] = $message;
-        });
-        $this->app->instance('log', $log);
-        $this->app->forgetInstance(Recorder::class);
 
-        $this->app->make(Recorder::class);
+        $capture = function (bool $enabled, int $builds) use (&$warnings, $warned): void {
+            $this->bootWith(['wiretap.enabled' => $enabled, 'wiretap.blocklist' => ['ok.test', 42]]);
+            // Booting already built the recorder with the real logger.
+            $warned->setValue(null, []);
 
-        expect(implode("\n", $warnings))->toContain('wiretap.blocklist entries must be strings');
+            $log = Mockery::mock();
+            $log->shouldReceive('warning')->andReturnUsing(function (string $message) use (&$warnings): void {
+                $warnings[] = $message;
+            });
+            $this->app->instance('log', $log);
+
+            for ($i = 0; $i < $builds; $i++) {
+                $this->app->forgetInstance(Recorder::class);
+                $this->app->make(Recorder::class);
+            }
+        };
+
+        $capture(false, 1);
+        expect($warnings)->toBe([]);
+
+        $capture(true, 3);
+
+        expect($warnings)->toHaveCount(1)
+            ->and($warnings[0])->toContain('wiretap.blocklist entries must be strings');
+    });
+
+    it('fails a malformed preset closed too, without breaking doctor', function (): void {
+        // Core's error path calls the provider's name(), which implodes the
+        // presets: an object raised an error from inside core's catch.
+        $this->bootWith(['wiretap.presets' => [new stdClass()]]);
+
+        $blocklist = $this->app->make(Recorder::class)->blocklist();
+
+        expect($blocklist->hasFailedClosed())->toBeTrue()
+            ->and(implode("\n", $blocklist->errors()))->toContain('wiretap.presets entries must be strings');
+
+        Artisan::call('wiretap:doctor');
+    });
+
+    it('reads a comma-separated blocklist string as rules, not as one host', function (): void {
+        // `'blocklist' => env('X')` gave one literal entry: every rule in it
+        // silently absent.
+        $this->bootWith(['wiretap.blocklist' => 'pay.test,*.acquirer.test']);
+
+        $blocklist = $this->app->make(Recorder::class)->blocklist();
+
+        expect($blocklist->blocks('https://pay.test/x'))->toBeTrue()
+            ->and($blocklist->blocks('https://a.acquirer.test/x'))->toBeTrue();
     });
 
     it('blocks all capture until it is corrected, and says why', function (): void {

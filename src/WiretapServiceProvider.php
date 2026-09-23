@@ -50,6 +50,13 @@ final class WiretapServiceProvider extends ServiceProvider
      */
     private const EXIT_SIGNAL_BASE = 128;
 
+    /**
+     * Configuration refusals already logged by this process.
+     *
+     * @var array<string, true>
+     */
+    private static array $warned = [];
+
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/wiretap.php', 'wiretap');
@@ -329,46 +336,72 @@ final class WiretapServiceProvider extends ServiceProvider
      */
     private function buildBlocklist(array $config): Blocklist
     {
+        $enabled = self::truthy($config['enabled'] ?? false);
+
+        // A string is what `'blocklist' => env('WIRETAP_BLOCK')` gives, and
+        // (array) made the whole comma-separated list one literal host: every
+        // rule in it silently absent, with doctor showing a green tick.
+        $blocklist = $config['blocklist'] ?? [];
+        $blocklist = is_string($blocklist) ? EnvBlocklistProvider::parse($blocklist) : (array) $blocklist;
+
         return new Blocklist([
             // Falls back to the payment-gateway preset, not to nothing. Every
             // other key here falls back to its safe value; an absent presets
             // key silently emptying the gate would be the one exception, and
             // the wrong way round.
-            new PresetBlocklistProvider(array_values(
+            $this->validatedProvider(
                 (array) ($config['presets'] ?? [PresetBlocklistProvider::PAYMENT_GATEWAYS]),
-            )),
-            $this->configuredBlocklist((array) ($config['blocklist'] ?? [])),
+                'wiretap.presets',
+                static fn (array $presets): BlocklistProvider => new PresetBlocklistProvider($presets),
+                $enabled,
+            ),
+            $this->validatedProvider(
+                $blocklist,
+                'wiretap.blocklist',
+                static fn (array $entries): BlocklistProvider => new ArrayBlocklistProvider($entries, 'config:wiretap.blocklist'),
+                $enabled,
+            ),
             new EnvBlocklistProvider(),
         ]);
     }
 
     /**
-     * The configured entries as a provider, failing closed inside core.
+     * Configured entries as a provider, failing closed inside core.
      *
      * A malformed entry used to throw here, while the recorder was being
      * built — outside core's fail-closed handling — so boot() could not
      * resolve the recorder and the application went down, with capture off as
-     * well. A blocklist typo must cost the capture, not the site.
+     * well. A malformed preset got further but no better: core's error path
+     * calls the provider's name(), which implodes the presets, so a nested
+     * array raised "Array to string conversion" from inside core's catch and
+     * crashed wiretap:doctor. A blocklist typo must cost the capture, not the
+     * site.
      *
      * So the refusal is handed to core as a provider that throws when read.
      * Core treats a throwing provider as "block everything" and reports it
-     * in errors(), which doctor prints; the warning here says the same thing
-     * in the application log, where someone will see it without running
-     * doctor.
+     * in errors(), which doctor prints. With capture on, a warning says the
+     * same thing in the application log, once per process: the recorder is
+     * built on every request, and a warning per request would flood any
+     * channel that pages someone.
      *
-     * @param array<array-key, mixed> $entries
+     * @param array<array-key, mixed>                          $entries
+     * @param \Closure(list<string>): BlocklistProvider        $build
      */
-    private function configuredBlocklist(array $entries): BlocklistProvider
+    private function validatedProvider(array $entries, string $key, \Closure $build, bool $enabled): BlocklistProvider
     {
-        $name = 'config:wiretap.blocklist';
+        $name = 'config:' . $key;
 
         try {
-            return new ArrayBlocklistProvider(self::blocklistEntries($entries), $name);
+            return $build(self::blocklistEntries($entries, $key));
         } catch (\InvalidArgumentException $refused) {
-            try {
-                $this->app->make('log')->warning('wiretap: ' . $refused->getMessage());
-            } catch (\Throwable) {
-                // No logger yet; core's errors() and doctor still say so.
+            if ($enabled && !isset(self::$warned[$refused->getMessage()])) {
+                self::$warned[$refused->getMessage()] = true;
+
+                try {
+                    $this->app->make('log')->warning('wiretap: ' . $refused->getMessage());
+                } catch (\Throwable) {
+                    // No logger; core's errors() and doctor still say so.
+                }
             }
 
             return new class ($refused, $name) implements BlocklistProvider {
@@ -406,22 +439,23 @@ final class WiretapServiceProvider extends ServiceProvider
      *
      * Nested arrays are flattened, because that typo has an obvious intent.
      * Anything else is refused, which makes core fail closed and block all
-     * capture until it is fixed (see configuredBlocklist()). Loud and safe
+     * capture until it is fixed (see validatedProvider()). Loud and safe
      * beats quiet and wrong for a control whose job is keeping cardholder
      * data out of the capture.
      *
      * @param  array<array-key, mixed> $entries
      * @return list<string>
      */
-    private static function blocklistEntries(array $entries): array
+    private static function blocklistEntries(array $entries, string $key = 'wiretap.blocklist'): array
     {
         $flat = [];
 
-        array_walk_recursive($entries, static function (mixed $entry) use (&$flat): void {
+        array_walk_recursive($entries, static function (mixed $entry) use (&$flat, $key): void {
             if (!is_string($entry)) {
                 throw new \InvalidArgumentException(sprintf(
-                    'wiretap.blocklist entries must be strings, found %s. '
+                    '%s entries must be strings, found %s. '
                     . 'Blocking all traffic until this is corrected.',
+                    $key,
                     get_debug_type($entry),
                 ));
             }
