@@ -6,6 +6,7 @@ namespace Ssx\Wiretap\Laravel;
 
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\HandlerStack;
+use Illuminate\Console\Application as ConsoleApplication;
 use Illuminate\Console\Events\CommandFinished;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Http\Kernel;
@@ -13,6 +14,7 @@ use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Console\WorkCommand;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\ServiceProvider;
@@ -44,10 +46,25 @@ use Ssx\Wiretap\Wiretap;
 final class WiretapServiceProvider extends ServiceProvider
 {
     /**
-     * Shells report a signal death as 128 + signal number; matching that keeps
-     * `echo $?` saying what it would have said without wiretap installed.
+     * Commands that run jobs, each of which gets its own correlation. Any
+     * subclass of Laravel's WorkCommand counts too, whatever it is called.
      */
-    private const EXIT_SIGNAL_BASE = 128;
+    private const WORKER_COMMANDS = ['queue:work', 'queue:listen', 'horizon:work'];
+
+    /**
+     * The console application, to tell a worker by what it is.
+     *
+     * @var \WeakReference<ConsoleApplication>|null
+     */
+    private static ?\WeakReference $artisan = null;
+
+    /**
+     * Commands running in this process, outermost first, each with the
+     * command name it displaced and whether it owns the correlation.
+     *
+     * @var list<array{previous: ?string, owns: bool}>
+     */
+    private static array $commands = [];
 
     public function register(): void
     {
@@ -98,7 +115,6 @@ final class WiretapServiceProvider extends ServiceProvider
         $this->registerCorrelationMiddleware();
         $this->registerQueueCorrelation();
         $this->registerConsoleCorrelation();
-        $this->registerSignalFlush();
 
         // Octane runs terminating callbacks per request, and a queue worker
         // per job. Without this the recorder flushed only at 200 records, 8
@@ -425,8 +441,17 @@ final class WiretapServiceProvider extends ServiceProvider
      * The flush matters as much as the id. A short command never reaches the
      * terminating callback in time to be useful, and a daemon — horizon,
      * schedule:work — never reaches it at all, so records sat in the buffer
-     * until the 200-record threshold or process exit, and PHP runs no shutdown
-     * functions on the SIGTERM that supervisor and Kubernetes send.
+     * until the 200-record threshold or process exit.
+     *
+     * There is deliberately no SIGTERM handler. PHP runs no shutdown functions
+     * on that signal, so a daemon killed by a process manager loses what it
+     * had buffered — but every handler tried in its place changed how
+     * applications shut down. One exit()ed ahead of a command's own trap();
+     * the replacement had to guess whether the handlers around it meant to
+     * terminate, and guessed wrong for a command using deferred dispatch and
+     * for a handler that chains to the previous one. Symfony's own
+     * ConsoleEvents::SIGNAL never fires under Laravel, which dispatches no
+     * signals to it. Losing a debugging buffer is the lesser harm.
      */
     private function registerConsoleCorrelation(): void
     {
@@ -436,73 +461,77 @@ final class WiretapServiceProvider extends ServiceProvider
 
         $events = $this->app->make('events');
 
-        $events->listen(CommandStarting::class, static function (CommandStarting $event): void {
-            Correlation::reset();
-            Correlation::start();
+        $jobs = $this->app->make(StartJobCorrelation::class);
+
+        // A fresh application starts with no commands running.
+        self::$commands = [];
+        RunningContext::command(null, set: true);
+
+        ConsoleApplication::starting(static function (ConsoleApplication $artisan): void {
+            self::$artisan = \WeakReference::create($artisan);
+        });
+
+        $events->listen(CommandStarting::class, static function (CommandStarting $event) use ($jobs): void {
+            // A command run from inside something that already owns the
+            // correlation — Artisan::call() from a request, from a job, or
+            // from another command — is part of that unit of work. Resetting
+            // here split its trace in two and flushed to disk in the middle of
+            // a request; now that each job owns its correlation, it also cut
+            // every job that calls a command in half.
+            $owns = self::$commands === []
+                && !StartCorrelation::isHandlingRequest()
+                && !$jobs->inJob();
+
+            self::$commands[] = ['previous' => RunningContext::command(), 'owns' => $owns];
+
+            if ($owns) {
+                Correlation::reset();
+
+                // A worker is not one unit of work, and must not own a
+                // correlation. Starting one explicitly made the job listener
+                // see an enclosing scope for every job, so none took
+                // ownership: a real queue:work gave every job the worker's id
+                // and one sampling decision, and flushed nothing until it
+                // exited. Testbench never showed it, because it does not route
+                // Symfony's console events.
+                if (!self::isWorker($event->command)) {
+                    Correlation::start();
+                }
+            }
+
             // So the record names this command rather than argv[1], which in
             // a worker is "queue:work" for every job it ever handles.
             RunningContext::command($event->command, set: true);
         });
 
         $events->listen(CommandFinished::class, static function (CommandFinished $event): void {
+            $frame = array_pop(self::$commands) ?? ['previous' => null, 'owns' => true];
+
+            RunningContext::command($frame['previous'], set: true);
+
+            if (!$frame['owns']) {
+                return;
+            }
+
             Wiretap::recorder()->flush();
             Correlation::reset();
-            RunningContext::command(null, set: true);
         });
     }
 
-    /**
-     * Flush on the signal a process manager sends to stop a daemon.
-     *
-     * PHP runs no shutdown functions on SIGTERM — verified, not assumed — and
-     * SIGTERM is what supervisor, systemd and Kubernetes send. A long-running
-     * console process that is not a queue worker (reverb:start, a custom
-     * `while (true)` command) reaches neither CommandFinished nor the
-     * terminating callback, so whatever it had buffered was discarded on every
-     * restart and deploy: up to 200 records, up to 8 MiB.
-     *
-     * A queue worker is already covered — it flushes as each owned job
-     * finishes — and short commands are covered by CommandFinished. This is
-     * for what is left.
-     *
-     * Any handler already installed is called afterwards, so this adds a flush
-     * rather than taking over the signal. A component that installs its own
-     * handler *later* replaces this one; Laravel's queue worker does exactly
-     * that, and that is fine, because the worker flushes per job anyway.
-     */
-    private function registerSignalFlush(): void
+    private static function isWorker(string $command): bool
     {
-        if (!$this->app->runningInConsole()
-            || !function_exists('pcntl_signal')
-            || !function_exists('pcntl_async_signals')) {
-            return;
+        if (in_array($command, self::WORKER_COMMANDS, true)) {
+            return true;
         }
 
-        pcntl_async_signals(true);
+        $artisan = self::$artisan?->get();
 
-        foreach ([SIGTERM, SIGINT] as $signal) {
-            $previous = pcntl_signal_get_handler($signal);
-
-            pcntl_signal($signal, static function (int $received) use ($previous): void {
-                try {
-                    Wiretap::recorder()->flush();
-                } catch (\Throwable) {
-                    // Never let instrumentation change how a process dies.
-                }
-
-                if (is_callable($previous)) {
-                    $previous($received);
-
-                    return;
-                }
-
-                // SIG_DFL for these two means terminate, and nothing else has
-                // asked to handle it — so do what the default would have done
-                // rather than swallowing the signal and hanging the process.
-                if ($previous === SIG_DFL) {
-                    exit(self::EXIT_SIGNAL_BASE + $received);
-                }
-            });
+        try {
+            return $artisan !== null
+                && $artisan->has($command)
+                && $artisan->get($command) instanceof WorkCommand;
+        } catch (\Throwable) {
+            return false;
         }
     }
 

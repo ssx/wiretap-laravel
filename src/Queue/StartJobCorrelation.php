@@ -108,6 +108,14 @@ final class StartJobCorrelation
         $this->finish($event->job);
     }
 
+    /**
+     * Whether a job is being processed right now.
+     */
+    public function inJob(): bool
+    {
+        return $this->stack !== [];
+    }
+
     private function finish(Job $job): void
     {
         $id = $this->idFor($job);
