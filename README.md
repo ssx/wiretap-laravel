@@ -140,9 +140,16 @@ WIRETAP_HASH_SALT=                  # an empty value keeps no digest at all
 
 With no `app.key` and no `WIRETAP_HASH_SALT`, these bodies keep no digest.
 The digest itself comes from the capture layer: raw curl captured by
-`ssx/wiretap-auto` always carries one, while the Guzzle bridge (the `Http`
-facade and the container's client) does not hash full bodies by default, so
-its omitted and truncated bodies keep no digest either way.
+`ssx/wiretap-auto` always carries one, and the `Http` facade and the
+container's Guzzle client hash the whole body whenever redaction is on and a
+key is in effect. They hash only what they already read to capture the body,
+so a body over the 1 MiB capture budget, a streamed response and a
+non-seekable body keep no digest. Hashing costs roughly 0.4 ms per 64 KiB of
+body; to skip it:
+
+```dotenv
+WIRETAP_HASH_FULL_BODY=false
+```
 
 ## Requirements
 
