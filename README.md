@@ -30,7 +30,10 @@ data the moment it was installed would be indefensible.
 
 The last two need [`ssx/wiretap-auto`](https://github.com/ssx/wiretap-auto),
 which hooks the functions themselves. `php artisan wiretap:doctor` will tell
-you which of these are live.
+you which of these are live. Installed together, each call is still recorded
+once: the `Http` facade and container Guzzle calls are recorded by this
+package, with bodies, and wiretap-auto (v0.0.8 or later) records only what
+this package does not.
 
 ## It does not break `Http::fake()`
 

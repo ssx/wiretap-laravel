@@ -19,7 +19,7 @@
     "require": {
         "php": "^8.2",
         "ssx/wiretap": "~0.0.15 || dev-main",
-        "ssx/wiretap-guzzle": "~0.0.7 || dev-main",
+        "ssx/wiretap-guzzle": "~0.0.10 || dev-main",
         "illuminate/support": "^11.0 || ^12.0",
         "illuminate/http": "^11.0 || ^12.0",
         "illuminate/console": "^11.0 || ^12.0",
@@ -29,7 +29,8 @@
         "mockery/mockery": "^1.6",
         "orchestra/testbench": "^9.0 || ^10.0",
         "pestphp/pest": "^2.34 || ^3.0",
-        "phpstan/phpstan": "^1.11"
+        "phpstan/phpstan": "^1.11",
+        "ssx/wiretap-auto": "~0.0.8 || dev-main"
     },
     "suggest": {
         "ssx/wiretap-auto": "Also captures raw curl_exec() and vendor-constructed Guzzle clients"
@@ -42,6 +43,10 @@
         {
             "type": "vcs",
             "url": "https://github.com/ssx/wiretap-guzzle"
+        },
+        {
+            "type": "vcs",
+            "url": "https://github.com/ssx/wiretap-auto"
         }
     ],
     "autoload": {
