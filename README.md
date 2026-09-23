@@ -124,6 +124,26 @@ on its own silently drops the env blocklist.
 Wiretap cannot know which of your endpoints carry cardholder data or which
 keys in your payloads are sensitive. You do.
 
+### Digests of bodies that were not stored
+
+A body that is omitted (binary, or dropped by redaction) or truncated keeps a
+digest so you can still tell whether two calls carried the same payload. Core
+only keeps it as an HMAC, never as a plain SHA-256, because a plain hash of a
+short payload can be brute-forced back to the payload. The key defaults to one
+derived from `app.key` (`hash_hmac('sha256', 'wiretap-redaction', app.key)`),
+kept separate from the key sampling uses.
+
+```dotenv
+WIRETAP_HASH_SALT=your-own-secret   # use this key instead, e.g. to compare digests across installs
+WIRETAP_HASH_SALT=                  # an empty value keeps no digest at all
+```
+
+With no `app.key` and no `WIRETAP_HASH_SALT`, these bodies keep no digest.
+The digest itself comes from the capture layer: raw curl captured by
+`ssx/wiretap-auto` always carries one, while the Guzzle bridge (the `Http`
+facade and the container's client) does not hash full bodies by default, so
+its omitted and truncated bodies keep no digest either way.
+
 ## Requirements
 
 PHP 8.2+, Laravel 11 or 12.

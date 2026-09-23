@@ -455,7 +455,45 @@ final class WiretapServiceProvider extends ServiceProvider
             maxHeaderValueBytes: (int) ($redaction['max_header_value_bytes'] ?? $defaults->maxHeaderValueBytes),
             minEchoedSecretLength: (int) ($redaction['min_echoed_secret_length'] ?? $defaults->minEchoedSecretLength),
             omitUninspectableBodies: self::protective($redaction['omit_uninspectable_bodies'] ?? true),
+            // hashHint is left at core's default (off), so an absent salt can
+            // never trip core's "hash hints need a hashSalt" check at boot.
+            hashSalt: self::hashSalt($redaction),
         );
+    }
+
+    /**
+     * The key for the digest core keeps of a body it did not store.
+     *
+     * An omitted or truncated body keeps a digest only as an HMAC under
+     * RedactionConfig::$hashSalt, and none without one: a plain SHA-256 of a
+     * short payload beside its own redaction can be brute-forced back to the
+     * payload. With no salt set, every such body lost the "did this body
+     * change between calls" comparison.
+     *
+     * The default is derived from app.key rather than being app.key itself,
+     * because the sampler is already keyed with app.key. One secret serving
+     * two purposes is avoidable, and a labelled HMAC keeps the two keys
+     * independent while still needing no new configuration.
+     *
+     * `hash_salt` overrides it and is used as it is. An empty string turns
+     * the digest off. Null (unset) falls back to the derived key, and to no
+     * digest when the application has no key.
+     *
+     * @param array<string, mixed> $redaction
+     */
+    private static function hashSalt(array $redaction): ?string
+    {
+        $configured = $redaction['hash_salt'] ?? null;
+
+        if (is_string($configured)) {
+            return trim($configured) === '' ? null : $configured;
+        }
+
+        $key = config('app.key');
+
+        return is_string($key) && trim($key) !== ''
+            ? hash_hmac('sha256', 'wiretap-redaction', $key)
+            : null;
     }
 
     /**
