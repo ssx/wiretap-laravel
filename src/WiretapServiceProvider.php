@@ -24,6 +24,7 @@ use Ssx\Wiretap\Blocklist\Blocklist;
 use Ssx\Wiretap\Blocklist\EnvBlocklistProvider;
 use Ssx\Wiretap\Blocklist\PresetBlocklistProvider;
 use Ssx\Wiretap\Contract\BlocklistProvider;
+use Ssx\Wiretap\Guzzle\BodyCapture;
 use Ssx\Wiretap\Guzzle\Stack;
 use Ssx\Wiretap\Guzzle\WiretapMiddleware;
 use Ssx\Wiretap\Laravel\Console\DoctorCommand;
@@ -497,6 +498,35 @@ final class WiretapServiceProvider extends ServiceProvider
     }
 
     /**
+     * Whether the Guzzle capture hashes the whole body it reads.
+     *
+     * Core keeps a digest of a body it did not store in full — truncated, or
+     * omitted as binary — only as an HMAC under the redaction salt, and it
+     * can only do that when the capture layer supplies the SHA-256 of the
+     * whole body. The Guzzle bridge leaves that off by default, because a
+     * raw SHA-256 beside a stored prefix is brute-forceable; core now keys it
+     * or drops it, so with a salt in effect the digest is safe to supply.
+     *
+     * On by default only when that holds: redaction is running and a salt
+     * is set. Without either, core would have nothing to key the digest with
+     * (or, with redaction off, would not touch it), so it is forced off
+     * whatever `hash_full_body` says. Only a recognised false value turns it
+     * off otherwise.
+     *
+     * It reads nothing the capture does not already read: the hash budget is
+     * the capture budget, so a body too large to capture whole is not read
+     * further to hash it, and gets no digest.
+     *
+     * @param array<string, mixed> $redaction
+     */
+    private static function hashFullBody(array $redaction): bool
+    {
+        return self::protective($redaction['enabled'] ?? true)
+            && self::hashSalt($redaction) !== null
+            && self::protective($redaction['hash_full_body'] ?? true);
+    }
+
+    /**
      * Configured strings added to core's defaults, de-duplicated.
      *
      * @param  list<string> $defaults
@@ -898,13 +928,17 @@ final class WiretapServiceProvider extends ServiceProvider
         // an observability package must not change how anyone's tests behave.
         $factory = class_exists(Http::class) ? Http::getFacadeRoot() : null;
 
+        $bodyCapture = new BodyCapture(
+            hashFullBody: self::hashFullBody((array) config('wiretap.redaction', [])),
+        );
+
         if (($capture['http_client'] ?? true)
             && $factory instanceof HttpFactory
             && !self::alreadyInstalled($factory)) {
             // Resolved per call, not captured here: middleware is pushed once
             // at boot, and a host application's test calling Wiretap::fake()
             // afterwards must be able to redirect this traffic.
-            Http::globalMiddleware(new WiretapMiddleware(static fn (): Recorder => Wiretap::recorder()));
+            Http::globalMiddleware(new WiretapMiddleware(static fn (): Recorder => Wiretap::recorder(), $bodyCapture));
         }
 
         // Anything resolving Guzzle from the container gets a recorded client.
@@ -923,7 +957,7 @@ final class WiretapServiceProvider extends ServiceProvider
                 /**
                  * @param array<string, mixed> $parameters
                  */
-                static function ($app, array $parameters = []): GuzzleClient {
+                static function ($app, array $parameters = []) use ($bodyCapture): GuzzleClient {
                     // Honour make()/makeWith() parameters. Discarding them
                     // meant app(Client::class, ['config' => [...]]) silently
                     // lost base_uri, auth and timeouts that had previously
@@ -946,7 +980,7 @@ final class WiretapServiceProvider extends ServiceProvider
                     $handler = $config['handler'] ?? null;
 
                     if ($handler instanceof HandlerStack) {
-                        $config['handler'] = Stack::attach($handler, $resolver);
+                        $config['handler'] = Stack::attach($handler, $resolver, $bodyCapture);
                     } elseif (is_callable($handler)) {
                         // A bare stack around it, not HandlerStack::create():
                         // that adds http_errors, redirect, cookie and
@@ -954,9 +988,9 @@ final class WiretapServiceProvider extends ServiceProvider
                         // callable handler, so a MockHandler's 404 became a
                         // ClientException and a 302 was followed — with
                         // capture off too.
-                        $config['handler'] = Stack::attach(new HandlerStack($handler), $resolver);
+                        $config['handler'] = Stack::attach(new HandlerStack($handler), $resolver, $bodyCapture);
                     } else {
-                        $config['handler'] = Stack::wrap($resolver);
+                        $config['handler'] = Stack::wrap($resolver, null, $bodyCapture);
                     }
 
                     return new GuzzleClient($config);

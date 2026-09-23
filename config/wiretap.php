@@ -142,6 +142,14 @@ return [
         // share digests across installs; set it to an empty string to keep
         // no digest at all.
         'hash_salt' => env('WIRETAP_HASH_SALT'),
+
+        // Hash the whole body the Http facade and container Guzzle client
+        // send and receive, so a body stored only in part (or omitted as
+        // binary) keeps that keyed digest. Takes effect only while redaction
+        // is on and a hash salt is in effect; without one it is off whatever
+        // this says. It reads nothing the capture does not read already: a
+        // body larger than the 1 MiB capture budget gets no digest.
+        'hash_full_body' => env('WIRETAP_HASH_FULL_BODY', true),
     ],
 
     /*
