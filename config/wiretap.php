@@ -134,6 +134,14 @@ return [
         // Shorter echoed values are not swept from response bodies, because a
         // short token corrupts unrelated prose wherever it happens to appear.
         'min_echoed_secret_length' => 8,
+
+        // A body that is omitted or truncated keeps a digest of itself only
+        // as an HMAC under this key, so two calls can still be compared
+        // without the digest being reversible. Unset, it is derived from
+        // app.key (not app.key itself, which already keys sampling). Set it to
+        // share digests across installs; set it to an empty string to keep
+        // no digest at all.
+        'hash_salt' => env('WIRETAP_HASH_SALT'),
     ],
 
     /*
