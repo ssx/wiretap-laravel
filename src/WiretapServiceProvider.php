@@ -187,6 +187,29 @@ final class WiretapServiceProvider extends ServiceProvider
     }
 
     /**
+     * Interpret a switch whose "on" is the safe state.
+     *
+     * truthy() maps anything it cannot read to false, which is right for
+     * `enabled` — an unrecognised value must not start recording — and exactly
+     * wrong for a protection. WIRETAP_REDACT=treu turned redaction off
+     * entirely, so every credential and card number the redactor would have
+     * removed went to disk in plaintext.
+     *
+     * So a protection stays on unless it is switched off in a way that
+     * cannot be mistaken: false, 0, or one of the strings below. A typo, an
+     * empty value or anything else keeps it on.
+     */
+    public static function protective(mixed $value): bool
+    {
+        if ($value === false || $value === 0) {
+            return false;
+        }
+
+        return !(is_string($value)
+            && in_array(strtolower(trim($value)), ['false', '0', 'off', 'no'], true));
+    }
+
+    /**
      * The secret the sampling decision is keyed with.
      *
      * Sampling is deterministic on the correlation id, and StartCorrelation
@@ -235,7 +258,27 @@ final class WiretapServiceProvider extends ServiceProvider
     {
         $path = $config['path'] ?? null;
 
-        return is_string($path) && trim($path) !== '' ? $path : Wiretap::defaultLogPath();
+        if (!is_string($path) || trim($path) === '') {
+            return Wiretap::defaultLogPath();
+        }
+
+        // A relative path is relative to the application, not to whatever
+        // the working directory happens to be. Under php-fpm that is
+        // public/, so WIRETAP_PATH=storage/wiretap wrote complete captures
+        // into the web root, where the webserver serves them to anyone.
+        if (!self::isAbsolute($path) && function_exists('base_path')) {
+            return base_path($path);
+        }
+
+        return $path;
+    }
+
+    private static function isAbsolute(string $path): bool
+    {
+        return str_starts_with($path, '/')
+            || str_starts_with($path, '\\')
+            || preg_match('~^[A-Za-z]:[\\\\/]~', $path) === 1
+            || preg_match('~^[A-Za-z][A-Za-z0-9+.-]*://~', $path) === 1;
     }
 
     private function buildRecorder(): Recorder
@@ -302,15 +345,29 @@ final class WiretapServiceProvider extends ServiceProvider
 
         $defaults = new RedactionConfig();
 
+        // Anything but a recognisable "allow" is core's default. Core treats
+        // an unknown mode as deny anyway; normalising here means ' Allow '
+        // gets the stricter mode its author asked for, and the header list
+        // below is built for the mode that will actually apply.
+        $mode = $redaction['header_mode'] ?? null;
+        $headerMode = is_string($mode) && strtolower(trim($mode)) === RedactionConfig::MODE_ALLOW
+            ? RedactionConfig::MODE_ALLOW
+            : $defaults->headerMode;
+
         return new RedactionConfig(
-            enabled: self::truthy($redaction['enabled'] ?? true),
-            headerMode: is_string($redaction['header_mode'] ?? null)
-                ? $redaction['header_mode']
-                : $defaults->headerMode,
+            enabled: self::protective($redaction['enabled'] ?? true),
+            headerMode: $headerMode,
             // Core's own lists are lowercase and it matches case-insensitively,
             // so configured names are lowered before merging — otherwise
             // 'Authorization' and 'authorization' both end up in the list.
-            headers: self::mergeList($defaults->headers, $redaction['headers'] ?? [], lower: true),
+            //
+            // In allow mode the list is what is kept, so it is exactly what
+            // was configured. Merging core's denylist into it "allowed"
+            // Authorization, Cookie and X-Api-Key — every header the denylist
+            // exists to remove — the moment someone chose the stricter mode.
+            headers: $headerMode === RedactionConfig::MODE_ALLOW
+                ? self::mergeList([], $redaction['headers'] ?? [], lower: true)
+                : self::mergeList($defaults->headers, $redaction['headers'] ?? [], lower: true),
             query: self::mergeList($defaults->query, $redaction['query'] ?? [], lower: true),
             bodyPaths: array_values((array) ($redaction['body_paths'] ?? [])),
             patterns: array_merge($defaults->patterns, array_filter(
@@ -318,12 +375,12 @@ final class WiretapServiceProvider extends ServiceProvider
                 static fn (mixed $v): bool => is_bool($v),
             )),
             custom: self::mergeList([], $redaction['custom'] ?? []),
-            safetyNet: self::truthy($redaction['safety_net'] ?? true),
+            safetyNet: self::protective($redaction['safety_net'] ?? true),
             capturableTypes: self::mergeList($defaults->capturableTypes, $redaction['capturable_types'] ?? []),
             maxBodyBytes: (int) ($redaction['max_body_bytes'] ?? $defaults->maxBodyBytes),
             maxHeaderValueBytes: (int) ($redaction['max_header_value_bytes'] ?? $defaults->maxHeaderValueBytes),
             minEchoedSecretLength: (int) ($redaction['min_echoed_secret_length'] ?? $defaults->minEchoedSecretLength),
-            omitUninspectableBodies: self::truthy($redaction['omit_uninspectable_bodies'] ?? true),
+            omitUninspectableBodies: self::protective($redaction['omit_uninspectable_bodies'] ?? true),
         );
     }
 

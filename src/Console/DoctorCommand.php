@@ -46,7 +46,10 @@ final class DoctorCommand extends Command
         // response bodies, by URL, to anyone.
         $path = WiretapServiceProvider::path((array) config('wiretap', []));
         $public = $this->publicPath();
-        $exposed = $public !== null && str_starts_with($this->real($path), $public);
+        // Compared as directories: a bare prefix test put
+        // /srv/app/public-logs inside /srv/app/public.
+        $exposed = $public !== null
+            && str_starts_with(rtrim($this->real($path), '/') . '/', rtrim($public, '/') . '/');
 
         $this->row(
             'log path',
@@ -98,13 +101,33 @@ final class DoctorCommand extends Command
     }
 
     /**
-     * realpath() where it resolves, the given path otherwise — a directory
-     * that does not exist yet is still worth checking.
+     * The path resolved through its nearest existing ancestor.
+     *
+     * realpath() fails for a directory that does not exist yet, which is the
+     * normal state before the first capture. Falling back to the raw path
+     * then compared an unresolved symlink — a deploy's current/ pointing at
+     * releases/7 — against a resolved web root, so they never matched and
+     * doctor showed a green tick for a path inside public/.
      */
     private function real(string $path): string
     {
-        $resolved = realpath($path);
+        $path = rtrim($path, '/');
+        $missing = [];
 
-        return is_string($resolved) ? $resolved : rtrim($path, '/');
+        while ($path !== '' && $path !== '.' && !is_string(realpath($path))) {
+            $parent = dirname($path);
+
+            if ($parent === $path) {
+                break;
+            }
+
+            array_unshift($missing, basename($path));
+            $path = $parent;
+        }
+
+        $resolved = realpath($path);
+        $base = is_string($resolved) ? $resolved : $path;
+
+        return rtrim(implode('/', [rtrim($base, '/'), ...$missing]), '/');
     }
 }
