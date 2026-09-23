@@ -23,6 +23,7 @@ use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Blocklist\Blocklist;
 use Ssx\Wiretap\Blocklist\EnvBlocklistProvider;
 use Ssx\Wiretap\Blocklist\PresetBlocklistProvider;
+use Ssx\Wiretap\Contract\BlocklistProvider;
 use Ssx\Wiretap\Guzzle\Stack;
 use Ssx\Wiretap\Guzzle\WiretapMiddleware;
 use Ssx\Wiretap\Laravel\Console\DoctorCommand;
@@ -65,6 +66,13 @@ final class WiretapServiceProvider extends ServiceProvider
      * @var list<array{previous: ?string, owns: bool}>
      */
     private static array $commands = [];
+
+    /**
+     * Configuration refusals already logged by this process.
+     *
+     * @var array<string, true>
+     */
+    private static array $warned = [];
 
     public function register(): void
     {
@@ -344,20 +352,92 @@ final class WiretapServiceProvider extends ServiceProvider
      */
     private function buildBlocklist(array $config): Blocklist
     {
+        $enabled = self::truthy($config['enabled'] ?? false);
+
+        // A string is what `'blocklist' => env('WIRETAP_BLOCK')` gives, and
+        // (array) made the whole comma-separated list one literal host: every
+        // rule in it silently absent, with doctor showing a green tick.
+        $blocklist = $config['blocklist'] ?? [];
+        $blocklist = is_string($blocklist) ? EnvBlocklistProvider::parse($blocklist) : (array) $blocklist;
+
         return new Blocklist([
             // Falls back to the payment-gateway preset, not to nothing. Every
             // other key here falls back to its safe value; an absent presets
             // key silently emptying the gate would be the one exception, and
             // the wrong way round.
-            new PresetBlocklistProvider(array_values(
+            $this->validatedProvider(
                 (array) ($config['presets'] ?? [PresetBlocklistProvider::PAYMENT_GATEWAYS]),
-            )),
-            new ArrayBlocklistProvider(
-                self::blocklistEntries((array) ($config['blocklist'] ?? [])),
-                'config:wiretap.blocklist',
+                'wiretap.presets',
+                static fn (array $presets): BlocklistProvider => new PresetBlocklistProvider($presets),
+                $enabled,
+            ),
+            $this->validatedProvider(
+                $blocklist,
+                'wiretap.blocklist',
+                static fn (array $entries): BlocklistProvider => new ArrayBlocklistProvider($entries, 'config:wiretap.blocklist'),
+                $enabled,
             ),
             new EnvBlocklistProvider(),
         ]);
+    }
+
+    /**
+     * Configured entries as a provider, failing closed inside core.
+     *
+     * A malformed entry used to throw here, while the recorder was being
+     * built — outside core's fail-closed handling — so boot() could not
+     * resolve the recorder and the application went down, with capture off as
+     * well. A malformed preset got further but no better: core's error path
+     * calls the provider's name(), which implodes the presets, so a nested
+     * array raised "Array to string conversion" from inside core's catch and
+     * crashed wiretap:doctor. A blocklist typo must cost the capture, not the
+     * site.
+     *
+     * So the refusal is handed to core as a provider that throws when read.
+     * Core treats a throwing provider as "block everything" and reports it
+     * in errors(), which doctor prints. With capture on, a warning says the
+     * same thing in the application log, once per process: the recorder is
+     * built on every request, and a warning per request would flood any
+     * channel that pages someone.
+     *
+     * @param array<array-key, mixed>                          $entries
+     * @param \Closure(list<string>): BlocklistProvider        $build
+     */
+    private function validatedProvider(array $entries, string $key, \Closure $build, bool $enabled): BlocklistProvider
+    {
+        $name = 'config:' . $key;
+
+        try {
+            return $build(self::blocklistEntries($entries, $key));
+        } catch (\InvalidArgumentException $refused) {
+            if ($enabled && !isset(self::$warned[$refused->getMessage()])) {
+                self::$warned[$refused->getMessage()] = true;
+
+                try {
+                    $this->app->make('log')->warning('wiretap: ' . $refused->getMessage());
+                } catch (\Throwable) {
+                    // No logger; core's errors() and doctor still say so.
+                }
+            }
+
+            return new class ($refused, $name) implements BlocklistProvider {
+                public function __construct(
+                    private readonly \InvalidArgumentException $refused,
+                    private readonly string $name,
+                ) {
+                }
+
+                public function patterns(): iterable
+                {
+                    throw $this->refused;
+                }
+
+                public function name(): string
+                {
+                    return $this->name;
+                }
+            };
+        }
     }
 
     /**
@@ -374,22 +454,24 @@ final class WiretapServiceProvider extends ServiceProvider
      * open without saying so is the worst outcome available here.
      *
      * Nested arrays are flattened, because that typo has an obvious intent.
-     * Anything else throws, which makes core fail closed and block everything
-     * until it is fixed. Loud and safe beats quiet and wrong for a control
-     * whose job is keeping cardholder data out of the capture.
+     * Anything else is refused, which makes core fail closed and block all
+     * capture until it is fixed (see validatedProvider()). Loud and safe
+     * beats quiet and wrong for a control whose job is keeping cardholder
+     * data out of the capture.
      *
      * @param  array<array-key, mixed> $entries
      * @return list<string>
      */
-    private static function blocklistEntries(array $entries): array
+    private static function blocklistEntries(array $entries, string $key = 'wiretap.blocklist'): array
     {
         $flat = [];
 
-        array_walk_recursive($entries, static function (mixed $entry) use (&$flat): void {
+        array_walk_recursive($entries, static function (mixed $entry) use (&$flat, $key): void {
             if (!is_string($entry)) {
                 throw new \InvalidArgumentException(sprintf(
-                    'wiretap.blocklist entries must be strings, found %s. '
+                    '%s entries must be strings, found %s. '
                     . 'Blocking all traffic until this is corrected.',
+                    $key,
                     get_debug_type($entry),
                 ));
             }
@@ -637,7 +719,13 @@ final class WiretapServiceProvider extends ServiceProvider
                     if ($handler instanceof HandlerStack) {
                         $config['handler'] = Stack::attach($handler, $resolver);
                     } elseif (is_callable($handler)) {
-                        $config['handler'] = Stack::attach(HandlerStack::create($handler), $resolver);
+                        // A bare stack around it, not HandlerStack::create():
+                        // that adds http_errors, redirect, cookie and
+                        // prepare-body middleware Guzzle never applies to a
+                        // callable handler, so a MockHandler's 404 became a
+                        // ClientException and a 302 was followed — with
+                        // capture off too.
+                        $config['handler'] = Stack::attach(new HandlerStack($handler), $resolver);
                     } else {
                         $config['handler'] = Stack::wrap($resolver);
                     }
