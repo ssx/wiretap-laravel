@@ -38,15 +38,18 @@
     "repositories": [
         {
             "type": "vcs",
-            "url": "https://github.com/ssx/wiretap"
+            "url": "https://github.com/ssx/wiretap",
+            "no-api": true
         },
         {
             "type": "vcs",
-            "url": "https://github.com/ssx/wiretap-guzzle"
+            "url": "https://github.com/ssx/wiretap-guzzle",
+            "no-api": true
         },
         {
             "type": "vcs",
-            "url": "https://github.com/ssx/wiretap-auto"
+            "url": "https://github.com/ssx/wiretap-auto",
+            "no-api": true
         }
     ],
     "autoload": {
