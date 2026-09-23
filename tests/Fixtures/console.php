@@ -12,7 +12,8 @@ declare(strict_types=1);
  * with it. This boots an application with APP_ENV=local and runs one command,
  * exactly as `php artisan` would.
  *
- * Usage: php console.php <command>   (WIRETAP_PATH, WIRETAP_ENABLED from env)
+ * Usage: php console.php <command> [args]   (WIRETAP_PATH, WIRETAP_ENABLED,
+ *        WIRETAP_FIXTURE_URL from env)
  */
 
 putenv('APP_ENV=local');
@@ -86,6 +87,44 @@ Artisan::starting(function (Artisan $artisan): void {
             }
 
             $this->line('cleanup ran, stop=' . var_export($this->stop, true));
+
+            return 0;
+        }
+    });
+
+    // Several completed calls, then killed by a process manager mid-run.
+    $artisan->add(new class extends Command {
+        protected $signature = 'fixture:calls {count=3}';
+
+        public function handle(): int
+        {
+            Http::fake(fn () => Http::response('{}', 200, ['Content-Type' => 'application/json']));
+
+            for ($i = 0; $i < (int) $this->argument('count'); $i++) {
+                Http::get('https://api.example.test/call/' . $i);
+            }
+
+            posix_kill(posix_getpid(), SIGTERM);
+            usleep(1_000_000);
+            $this->line('survived SIGTERM');
+
+            return 0;
+        }
+    });
+
+    // A raw curl call, seen only by wiretap-auto's hooks, then killed.
+    $artisan->add(new class extends Command {
+        protected $signature = 'fixture:curl';
+
+        public function handle(): int
+        {
+            $handle = curl_init((string) getenv('WIRETAP_FIXTURE_URL'));
+            curl_setopt($handle, CURLOPT_RETURNTRANSFER, true);
+            curl_exec($handle);
+
+            posix_kill(posix_getpid(), SIGTERM);
+            usleep(1_000_000);
+            $this->line('survived SIGTERM');
 
             return 0;
         }
