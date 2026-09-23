@@ -40,14 +40,21 @@ use Ssx\Wiretap\Sampler;
 use Ssx\Wiretap\Sink\NdjsonFileSink;
 use Ssx\Wiretap\Sink\NullSink;
 use Ssx\Wiretap\Wiretap;
+use Symfony\Component\Console\SignalRegistry\SignalRegistry;
 
 final class WiretapServiceProvider extends ServiceProvider
 {
     /**
-     * Shells report a signal death as 128 + signal number; matching that keeps
-     * `echo $?` saying what it would have said without wiretap installed.
+     * Commands that run jobs, each of which gets its own correlation.
      */
-    private const EXIT_SIGNAL_BASE = 128;
+    private const WORKER_COMMANDS = ['queue:work', 'queue:listen', 'horizon:work'];
+
+    /**
+     * The flush handler installed per signal, so it can recognise itself.
+     *
+     * @var array<int, \Closure>
+     */
+    private static array $signalHandlers = [];
 
     public function register(): void
     {
@@ -438,7 +445,17 @@ final class WiretapServiceProvider extends ServiceProvider
 
         $events->listen(CommandStarting::class, static function (CommandStarting $event): void {
             Correlation::reset();
-            Correlation::start();
+
+            // A worker is not one unit of work, and must not own a correlation.
+            // Starting one explicitly made the job listener see an enclosing
+            // scope for every job, so none took ownership: a real queue:work
+            // gave every job the worker's id and one sampling decision, and
+            // flushed nothing until it exited. Testbench never showed it,
+            // because it does not route Symfony's console events.
+            if (!in_array($event->command, self::WORKER_COMMANDS, true)) {
+                Correlation::start();
+            }
+
             // So the record names this command rather than argv[1], which in
             // a worker is "queue:work" for every job it ever handles.
             RunningContext::command($event->command, set: true);
@@ -454,56 +471,123 @@ final class WiretapServiceProvider extends ServiceProvider
     /**
      * Flush on the signal a process manager sends to stop a daemon.
      *
-     * PHP runs no shutdown functions on SIGTERM — verified, not assumed — and
-     * SIGTERM is what supervisor, systemd and Kubernetes send. A long-running
-     * console process that is not a queue worker (reverb:start, a custom
-     * `while (true)` command) reaches neither CommandFinished nor the
-     * terminating callback, so whatever it had buffered was discarded on every
-     * restart and deploy: up to 200 records, up to 8 MiB.
+     * PHP runs no shutdown functions on SIGTERM, and SIGTERM is what
+     * supervisor, systemd and Kubernetes send. A long-running console process
+     * that is not a queue worker (reverb:start, a custom `while (true)`
+     * command) reaches neither CommandFinished nor the terminating callback,
+     * so whatever it had buffered was discarded on every restart and deploy.
      *
-     * A queue worker is already covered — it flushes as each owned job
-     * finishes — and short commands are covered by CommandFinished. This is
-     * for what is left.
+     * The first version of this took the signal over, and that changed how
+     * applications shut down. It exit()ed whenever it found the default
+     * disposition behind it — but Symfony's signal registry chains the
+     * handler it finds, and Laravel's trap() runs its own callback first and
+     * ours after it, so a command that trapped SIGTERM to finish its current
+     * unit of work was killed with 143 before it could. It was installed with
+     * capture off, and it turned on pcntl_async_signals() for the whole
+     * process, letting every handler in it interrupt code that had chosen
+     * deferred dispatch.
      *
-     * Any handler already installed is called afterwards, so this adds a flush
-     * rather than taking over the signal. A component that installs its own
-     * handler *later* replaces this one; Laravel's queue worker does exactly
-     * that, and that is fine, because the worker flushes per job anyway.
+     * Symfony's own ConsoleEvents::SIGNAL would be the natural hook, but
+     * Laravel empties the list of signals it dispatches, so it never fires.
+     * So this is installed with the narrowest footprint that still works:
+     *
+     *  - only with capture on;
+     *  - only once a command is starting, when the console application exists
+     *    and has already chosen asynchronous delivery itself; with deferred
+     *    delivery a handler would hold a SIGTERM the default would have acted
+     *    on at once, so nothing is installed;
+     *  - only for a signal nobody else handles. An application, a signalable
+     *    command, or Octane owning SIGTERM owns it outright.
+     *
+     * When the signal arrives it flushes, then does whatever would have
+     * happened without it. If any other handler shares the signal, that
+     * handler decides: we return and the process carries on exactly as it
+     * would have. Otherwise the default disposition is restored and the signal
+     * re-raised, so the process dies by the signal as it always would have,
+     * rather than with an exit code that merely resembles it.
      */
     private function registerSignalFlush(): void
     {
-        if (!$this->app->runningInConsole()
+        if (!self::truthy(config('wiretap.enabled'))
+            || !$this->app->runningInConsole()
+            || !$this->app->bound('events')
             || !function_exists('pcntl_signal')
-            || !function_exists('pcntl_async_signals')) {
+            || !function_exists('pcntl_async_signals')
+            || !function_exists('pcntl_signal_get_handler')
+            || !function_exists('posix_kill')
+            || !function_exists('posix_getpid')) {
             return;
         }
 
-        pcntl_async_signals(true);
+        $this->app->make('events')->listen(CommandStarting::class, static function (): void {
+            self::installSignalFlush();
+        });
+    }
+
+    private static function installSignalFlush(): void
+    {
+        // Queried, never set.
+        if (!pcntl_async_signals()) {
+            return;
+        }
 
         foreach ([SIGTERM, SIGINT] as $signal) {
-            $previous = pcntl_signal_get_handler($signal);
+            // Also the idempotence check: once ours is installed, it is not
+            // the default any more.
+            if (pcntl_signal_get_handler($signal) !== SIG_DFL) {
+                continue;
+            }
 
-            pcntl_signal($signal, static function (int $received) use ($previous): void {
+            $handler = static function (int $received): void {
                 try {
                     Wiretap::recorder()->flush();
                 } catch (\Throwable) {
                     // Never let instrumentation change how a process dies.
                 }
 
-                if (is_callable($previous)) {
-                    $previous($received);
-
+                if (self::signalHandledElsewhere($received)) {
                     return;
                 }
 
-                // SIG_DFL for these two means terminate, and nothing else has
-                // asked to handle it — so do what the default would have done
-                // rather than swallowing the signal and hanging the process.
-                if ($previous === SIG_DFL) {
-                    exit(self::EXIT_SIGNAL_BASE + $received);
-                }
-            });
+                pcntl_signal($received, SIG_DFL);
+                posix_kill(posix_getpid(), $received);
+            };
+
+            self::$signalHandlers[$signal] = $handler;
+            pcntl_signal($signal, $handler);
         }
+    }
+
+    /**
+     * Whether some other handler shares this signal and so decides its outcome.
+     *
+     * Symfony's registry calls every handler registered for a signal, and
+     * includes the one it found installed — ours — among them. Laravel's
+     * trap() reorders that list to run its own callback first. Either way,
+     * when the registry holds more than just us, someone else chose to handle
+     * the signal and terminating here would overrule them.
+     */
+    private static function signalHandledElsewhere(int $signal): bool
+    {
+        // Typed int|string in PHP's stubs; it returns the callable in fact.
+        /** @var mixed $current */
+        $current = pcntl_signal_get_handler($signal);
+
+        if (is_array($current) && ($current[0] ?? null) instanceof SignalRegistry) {
+            // The registry keeps its list private; this is how Laravel's own
+            // Signals class reads it too.
+            /** @var mixed $handlers */
+            $handlers = \Closure::bind(
+                static fn (SignalRegistry $registry): mixed => $registry->signalHandlers[$signal] ?? [],
+                null,
+                SignalRegistry::class,
+            )($current[0]);
+
+            return is_array($handlers) && count($handlers) > 1;
+        }
+
+        // Called by something that replaced us and chains to us: it decides.
+        return $current !== (self::$signalHandlers[$signal] ?? null);
     }
 
     private function registerCorrelationMiddleware(): void
