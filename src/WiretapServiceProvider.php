@@ -21,6 +21,7 @@ use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Blocklist\Blocklist;
 use Ssx\Wiretap\Blocklist\EnvBlocklistProvider;
 use Ssx\Wiretap\Blocklist\PresetBlocklistProvider;
+use Ssx\Wiretap\Contract\BlocklistProvider;
 use Ssx\Wiretap\Guzzle\Stack;
 use Ssx\Wiretap\Guzzle\WiretapMiddleware;
 use Ssx\Wiretap\Laravel\Console\DoctorCommand;
@@ -336,12 +337,58 @@ final class WiretapServiceProvider extends ServiceProvider
             new PresetBlocklistProvider(array_values(
                 (array) ($config['presets'] ?? [PresetBlocklistProvider::PAYMENT_GATEWAYS]),
             )),
-            new ArrayBlocklistProvider(
-                self::blocklistEntries((array) ($config['blocklist'] ?? [])),
-                'config:wiretap.blocklist',
-            ),
+            $this->configuredBlocklist((array) ($config['blocklist'] ?? [])),
             new EnvBlocklistProvider(),
         ]);
+    }
+
+    /**
+     * The configured entries as a provider, failing closed inside core.
+     *
+     * A malformed entry used to throw here, while the recorder was being
+     * built — outside core's fail-closed handling — so boot() could not
+     * resolve the recorder and the application went down, with capture off as
+     * well. A blocklist typo must cost the capture, not the site.
+     *
+     * So the refusal is handed to core as a provider that throws when read.
+     * Core treats a throwing provider as "block everything" and reports it
+     * in errors(), which doctor prints; the warning here says the same thing
+     * in the application log, where someone will see it without running
+     * doctor.
+     *
+     * @param array<array-key, mixed> $entries
+     */
+    private function configuredBlocklist(array $entries): BlocklistProvider
+    {
+        $name = 'config:wiretap.blocklist';
+
+        try {
+            return new ArrayBlocklistProvider(self::blocklistEntries($entries), $name);
+        } catch (\InvalidArgumentException $refused) {
+            try {
+                $this->app->make('log')->warning('wiretap: ' . $refused->getMessage());
+            } catch (\Throwable) {
+                // No logger yet; core's errors() and doctor still say so.
+            }
+
+            return new class ($refused, $name) implements BlocklistProvider {
+                public function __construct(
+                    private readonly \InvalidArgumentException $refused,
+                    private readonly string $name,
+                ) {
+                }
+
+                public function patterns(): iterable
+                {
+                    throw $this->refused;
+                }
+
+                public function name(): string
+                {
+                    return $this->name;
+                }
+            };
+        }
     }
 
     /**
@@ -358,9 +405,10 @@ final class WiretapServiceProvider extends ServiceProvider
      * open without saying so is the worst outcome available here.
      *
      * Nested arrays are flattened, because that typo has an obvious intent.
-     * Anything else throws, which makes core fail closed and block everything
-     * until it is fixed. Loud and safe beats quiet and wrong for a control
-     * whose job is keeping cardholder data out of the capture.
+     * Anything else is refused, which makes core fail closed and block all
+     * capture until it is fixed (see configuredBlocklist()). Loud and safe
+     * beats quiet and wrong for a control whose job is keeping cardholder
+     * data out of the capture.
      *
      * @param  array<array-key, mixed> $entries
      * @return list<string>
@@ -608,7 +656,13 @@ final class WiretapServiceProvider extends ServiceProvider
                     if ($handler instanceof HandlerStack) {
                         $config['handler'] = Stack::attach($handler, $resolver);
                     } elseif (is_callable($handler)) {
-                        $config['handler'] = Stack::attach(HandlerStack::create($handler), $resolver);
+                        // A bare stack around it, not HandlerStack::create():
+                        // that adds http_errors, redirect, cookie and
+                        // prepare-body middleware Guzzle never applies to a
+                        // callable handler, so a MockHandler's 404 became a
+                        // ClientException and a 302 was followed — with
+                        // capture off too.
+                        $config['handler'] = Stack::attach(new HandlerStack($handler), $resolver);
                     } else {
                         $config['handler'] = Stack::wrap($resolver);
                     }
