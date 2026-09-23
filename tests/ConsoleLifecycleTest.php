@@ -19,18 +19,21 @@ use Symfony\Component\Console\Output\NullOutput;
 /**
  * Run tests/Fixtures/console.php as its own process.
  *
+ * @param list<string>          $args
+ * @param array<string, string> $env
+ *
  * @return array{exit: int, signal: int, output: string, records: list<array<string, mixed>>}
  */
-function runConsoleFixture(string $command, bool $enabled = true): array
+function runConsoleFixture(string $command, bool $enabled = true, array $args = [], array $env = []): array
 {
     $path = sys_get_temp_dir() . '/wiretap-console-' . bin2hex(random_bytes(6));
 
     $process = proc_open(
-        [PHP_BINARY, __DIR__ . '/Fixtures/console.php', $command],
+        [PHP_BINARY, __DIR__ . '/Fixtures/console.php', $command, ...$args],
         [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
         $pipes,
         null,
-        ['WIRETAP_PATH' => $path, 'WIRETAP_ENABLED' => $enabled ? 'true' : 'false', 'PATH' => (string) getenv('PATH')],
+        ['WIRETAP_PATH' => $path, 'WIRETAP_ENABLED' => $enabled ? 'true' : 'false', 'PATH' => (string) getenv('PATH')] + $env,
     );
 
     $output = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
@@ -121,6 +124,10 @@ final class LifecycleQueuedJob implements ShouldQueue
 
     public static ?bool $onDiskBeforeSecond = null;
 
+    public static bool $twoCalls = false;
+
+    public static ?bool $onDiskBetweenCalls = null;
+
     public function __construct(public string $name)
     {
     }
@@ -129,6 +136,11 @@ final class LifecycleQueuedJob implements ShouldQueue
     {
         Http::get('https://api.example.test/job/' . $this->name);
         self::$ids[$this->name] = Correlation::id();
+
+        if (self::$twoCalls && $this->name === 'a') {
+            self::$onDiskBetweenCalls = (glob((string) config('wiretap.path') . '/*.ndjson') ?: []) !== [];
+            Http::get('https://api.example.test/job/' . $this->name . '/again');
+        }
 
         if (self::$callsCommand) {
             Artisan::call('wiretap:doctor');
@@ -176,6 +188,56 @@ describe('signals', function (): void {
 
         expect($run['output'])->not->toContain('survived')
             ->and($run['signal'])->toBe(SIGTERM);
+    });
+
+    it('keeps every completed call of an ordinary command killed by SIGTERM', function (): void {
+        // A command that is not a worker buffered until CommandFinished, and
+        // PHP runs no shutdown functions on SIGTERM, so a deploy or scheduler
+        // timeout killing a long import lost every call it had made.
+        $run = runConsoleFixture('fixture:calls', args: ['5']);
+
+        expect($run['signal'])->toBe(SIGTERM)
+            ->and($run['output'])->not->toContain('survived')
+            ->and(array_column($run['records'], 'uri'))->toBe(array_map(
+                static fn (int $i): string => 'https://api.example.test/call/' . $i,
+                range(0, 4),
+            ));
+    });
+
+    it('keeps a raw curl call recorded by the hooks when killed by SIGTERM', function (): void {
+        // The same, for the calls only wiretap-auto sees: vendor code doing
+        // its own curl, which no middleware of ours can flush after.
+        if (!extension_loaded('opentelemetry') || !class_exists(\Ssx\Wiretap\Auto\Wiretap::class)) {
+            $this->markTestSkipped('needs ext-opentelemetry and ssx/wiretap-auto');
+        }
+
+        $docroot = sys_get_temp_dir() . '/wiretap-laravel-sigterm-' . bin2hex(random_bytes(4));
+        @mkdir($docroot, 0o755, true);
+        file_put_contents($docroot . '/index.php', '<?php header("Content-Type: application/json"); echo "{}";');
+
+        $port = 18796;
+        $server = proc_open(
+            sprintf('exec %s -S 127.0.0.1:%d -t %s', PHP_BINARY, $port, escapeshellarg($docroot)),
+            [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
+            $pipes,
+        );
+
+        try {
+            for ($i = 0; $i < 50 && ($socket = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1)) === false; $i++) {
+                usleep(100_000);
+            }
+
+            $run = runConsoleFixture('fixture:curl', env: ['WIRETAP_FIXTURE_URL' => "http://127.0.0.1:{$port}/raw"]);
+        } finally {
+            proc_terminate($server);
+            proc_close($server);
+            @unlink($docroot . '/index.php');
+            @rmdir($docroot);
+        }
+
+        expect($run['signal'])->toBe(SIGTERM)
+            ->and(array_column($run['records'], 'uri'))->toBe(["http://127.0.0.1:{$port}/raw"])
+            ->and($run['records'][0]['transport'])->toBe('curl');
     });
 
     it('does not change a killed process when capture is off', function (): void {
@@ -282,5 +344,49 @@ describe('commands called from a request', function (): void {
 
         expect($seen['after'])->toBe($seen['before'])
             ->and($seen['on_disk'])->toBeFalse();
+    });
+});
+
+describe('record batching', function (): void {
+    it('still writes nothing during a web request, even after a command ran in-process', function (): void {
+        // The per-record writes are for commands only. A request served by a
+        // process that had run one — a test suite, a long-lived host — must
+        // be back to batching, with no synchronous write on the request path.
+        $kernel = $this->app->make(ConsoleKernel::class);
+        $kernel->rerouteSymfonyCommandEvents();
+        $kernel->setArtisan(null);
+        Artisan::call('wiretap:doctor');
+
+        Http::fake(fn () => Http::response('{}', 200, ['Content-Type' => 'application/json']));
+        $path = $this->logPath;
+        $onDisk = null;
+
+        Illuminate\Support\Facades\Route::get('/batched', function () use ($path, &$onDisk) {
+            Http::get('https://api.example.test/one');
+            Http::get('https://api.example.test/two');
+            $onDisk = glob($path . '/*.ndjson') ?: [];
+
+            return 'ok';
+        });
+
+        $this->get('/batched')->assertOk();
+
+        expect($onDisk)->toBe([])
+            ->and(glob($path . '/*.ndjson') ?: [])->not->toBe([]);
+    });
+
+    it('still flushes a worker per job rather than per call', function (): void {
+        // A worker is not a command in this sense: its jobs keep batching
+        // and flush when each one ends.
+        LifecycleQueuedJob::$twoCalls = true;
+
+        try {
+            runRealWorker($this->app, 'queue:work');
+        } finally {
+            LifecycleQueuedJob::$twoCalls = false;
+        }
+
+        expect(LifecycleQueuedJob::$onDiskBetweenCalls)->toBeFalse()
+            ->and(LifecycleQueuedJob::$onDiskBeforeSecond)->toBeTrue();
     });
 });

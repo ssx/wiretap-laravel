@@ -63,7 +63,7 @@ final class WiretapServiceProvider extends ServiceProvider
      * Commands running in this process, outermost first, each with the
      * command name it displaced and whether it owns the correlation.
      *
-     * @var list<array{previous: ?string, owns: bool}>
+     * @var list<array{previous: ?string, owns: bool, recorder?: Recorder}>
      */
     private static array $commands = [];
 
@@ -351,7 +351,10 @@ final class WiretapServiceProvider extends ServiceProvider
             || preg_match('~^[A-Za-z][A-Za-z0-9+.-]*://~', $path) === 1;
     }
 
-    private function buildRecorder(): Recorder
+    /**
+     * @param int $maxBufferedRecords 1 writes each record as it is made.
+     */
+    private function buildRecorder(int $maxBufferedRecords = 200): Recorder
     {
         /** @var array<string, mixed> $config */
         $config = config('wiretap');
@@ -383,6 +386,7 @@ final class WiretapServiceProvider extends ServiceProvider
                     : (int) $config['slow_threshold_us'],
                 samplingSalt: self::samplingSalt($config),
             ),
+            maxBufferedRecords: $maxBufferedRecords,
             enabled: $enabled,
         );
 
@@ -649,14 +653,18 @@ final class WiretapServiceProvider extends ServiceProvider
      * until the 200-record threshold or process exit.
      *
      * There is deliberately no SIGTERM handler. PHP runs no shutdown functions
-     * on that signal, so a daemon killed by a process manager loses what it
-     * had buffered — but every handler tried in its place changed how
-     * applications shut down. One exit()ed ahead of a command's own trap();
-     * the replacement had to guess whether the handlers around it meant to
-     * terminate, and guessed wrong for a command using deferred dispatch and
-     * for a handler that chains to the previous one. Symfony's own
-     * ConsoleEvents::SIGNAL never fires under Laravel, which dispatches no
-     * signals to it. Losing a debugging buffer is the lesser harm.
+     * on that signal, so a command killed by a process manager lost whatever
+     * it had buffered — but every handler tried changed how applications shut
+     * down. One exit()ed ahead of a command's own trap(); the replacement had
+     * to guess whether the handlers around it meant to terminate, and guessed
+     * wrong for a command using deferred dispatch and for a handler that
+     * chains to the previous one. Symfony's own ConsoleEvents::SIGNAL never
+     * fires under Laravel, which dispatches no signals to it.
+     *
+     * So there is nothing left to lose instead: a command that is not a
+     * worker writes each record as it is made (see writeThrough()), and a
+     * kill loses at most the call in flight. Workers still flush per job, and
+     * web requests still batch until the response has gone.
      */
     private function registerConsoleCorrelation(): void
     {
@@ -676,7 +684,9 @@ final class WiretapServiceProvider extends ServiceProvider
             self::$artisan = \WeakReference::create($artisan);
         });
 
-        $events->listen(CommandStarting::class, static function (CommandStarting $event) use ($jobs): void {
+        $writeThrough = fn (): Recorder => $this->buildRecorder(maxBufferedRecords: 1);
+
+        $events->listen(CommandStarting::class, function (CommandStarting $event) use ($jobs, $writeThrough): void {
             // A command run from inside something that already owns the
             // correlation — Artisan::call() from a request, from a job, or
             // from another command — is part of that unit of work. Resetting
@@ -701,6 +711,12 @@ final class WiretapServiceProvider extends ServiceProvider
                 // Symfony's console events.
                 if (!self::isWorker($event->command)) {
                     Correlation::start();
+
+                    $displaced = $this->writeThrough($writeThrough);
+
+                    if ($displaced !== null) {
+                        self::$commands[array_key_last(self::$commands)]['recorder'] = $displaced;
+                    }
                 }
             }
 
@@ -709,7 +725,7 @@ final class WiretapServiceProvider extends ServiceProvider
             RunningContext::command($event->command, set: true);
         });
 
-        $events->listen(CommandFinished::class, static function (CommandFinished $event): void {
+        $events->listen(CommandFinished::class, function (CommandFinished $event): void {
             $frame = array_pop(self::$commands) ?? ['previous' => null, 'owns' => true];
 
             RunningContext::command($frame['previous'], set: true);
@@ -720,7 +736,59 @@ final class WiretapServiceProvider extends ServiceProvider
 
             Wiretap::recorder()->flush();
             Correlation::reset();
+
+            // Back to batching, for anything this process does next — a web
+            // request served after an in-process command must not write on
+            // the request path.
+            if (isset($frame['recorder']) && !Wiretap::isFaked()) {
+                Wiretap::setRecorder($frame['recorder']);
+                $this->app->instance(Recorder::class, $frame['recorder']);
+            }
         });
+    }
+
+    /**
+     * Make an ordinary command write each record as it is made.
+     *
+     * A command that is not a worker — a migration, an import, a scheduled
+     * report — has no per-job flush, and ran until CommandFinished with
+     * everything buffered. Killed by SIGTERM (a deploy, a scheduler timeout,
+     * a container stop) it lost every call it had made, which is exactly the
+     * run someone wants to see. A command makes calls at its own pace with
+     * nobody waiting on a response, so a synchronous write per record costs
+     * it nothing that matters; a web request, where it would, keeps batching.
+     *
+     * Done by replacing the recorder for the command's duration with one
+     * that buffers a single record, since core's buffer size is fixed at
+     * construction. Only when the recorder in use is this application's own:
+     * a fake, or one the application set itself, is left alone. Returns the
+     * recorder it displaced, to put back when the command finishes.
+     *
+     * @param \Closure(): Recorder $build
+     */
+    private function writeThrough(\Closure $build): ?Recorder
+    {
+        try {
+            $current = Wiretap::recorder();
+
+            if (Wiretap::isFaked()
+                || !$current->isEnabled()
+                || $current !== $this->app->make(Recorder::class)) {
+                return null;
+            }
+
+            // Anything buffered before the command started is written now,
+            // not stranded in a recorder that will receive nothing more.
+            $current->flush();
+
+            $replacement = $build();
+            Wiretap::setRecorder($replacement);
+            $this->app->instance(Recorder::class, $replacement);
+
+            return $current;
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private static function isWorker(string $command): bool
